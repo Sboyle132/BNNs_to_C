@@ -1,0 +1,32 @@
+# build artifacts
+*.o
+*.so
+csrc/bnn_infer
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# env
+env.sh
+
+# data / weights — see note below
+artifacts/
+input.bin
+output.bin# build artifacts
+csrc/*.o
+csrc/bnn_infer
+python/**/__pycache__/
+*.so
+*.pyc
+# generated data / weights (kept out of git)
+artifacts/*
+!artifacts/.gitkeep
+*.blob
+*.bin
+patch0.npy
+spec_out/
+thr_out/
