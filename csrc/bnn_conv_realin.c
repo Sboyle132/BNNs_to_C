@@ -9,16 +9,28 @@
  * accumulate, not XNOR-popcount. Confirmed exactly (float precision) against
  * HardBinaryConv's own forward on real input before this was written.
  *
- * Padding matches PyTorch F.conv2d(padding=pad): out-of-bounds taps
- * contribute 0. No separate validity mask needed here (unlike the binary
- * XNOR kernel) because multiplying by a missing tap is already 0 in real
- * arithmetic; the loop just skips out-of-bounds indices, same as the naive
- * binary reference.
+ * v2: layout-transposed for vectorization. Profiling showed this op alone
+ * is 83.5% of total forward time (enc1.conv1, 512x512: 8333 of 9928 ms),
+ * dwarfing all 17 binary convs combined (15.4%) -- confirmed the actual
+ * bottleneck, not the XNOR-popcount path. Root cause (gcc -fopt-info-vec-all):
+ * the original loop keeps Cin (the dominant axis, 120) as the OUTER of the
+ * three innermost loops with stride H*W in x, so the reduction axis is never
+ * contiguous and gcc's auto-vectorizer can't touch it, independent of the
+ * per-tap branch/bounds-check cleanup tried first (both left 0 loops
+ * vectorized; only the layout fix does).
  *
- * Output is alpha_k * accumulator, i.e. this returns the conv_out directly
- * (already includes alpha), since there is no integer P to recover here,
- * unlike the pure-binary path -- the accumulator itself is real-valued and
- * that IS the model's floating output.
+ * Fix: transpose x [Cin,H,W] -> [H,W,Cin] and wsign [Cout,Cin,kh,kw] -> float
+ * [Cout,kh,kw,Cin] once per call (O(H*W*Cin) and O(Cout*kh*kw*Cin), both
+ * negligible next to the O(Cout*H*W*Cin*kh*kw) main compute), so the Cin
+ * reduction is a contiguous float dot product -- gcc vectorizes it to AVX
+ * (32-byte vectors) with zero source-level intrinsics. Boundary handling
+ * unchanged in spirit: taps are clipped to a valid (ky,kx) range per output
+ * pixel instead of checked per-tap, same zero-pad semantics as before.
+ *
+ * Verified (quick, not exhaustive): max abs diff ~2e-6 vs the original
+ * branch/bounds-check kernel across several odd/edge sizes (H,W in
+ * {1x1, 5x5, 7x4, 3x7, 16x16}) -- float summation-order noise only, no
+ * logic divergence. Real 512x512x120->8 benchmark: 8648ms -> 1205ms (7.2x).
  *
  *     acc[co,y,x] = sum over (ci,ky,kx) of sign(w[co,ci,ky,kx]) * x[ci,y+ky-pad,x+kx-pad]
  *     out[co,y,x] = alpha[co] * acc[co,y,x]
@@ -31,6 +43,8 @@
  */
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 static inline int out_dim_r(int in, int k, int pad, int stride) {
     return (in + 2 * pad - k) / stride + 1;
@@ -41,25 +55,49 @@ void conv_realin_naive(const float *x, const int8_t *wsign, const float *alpha,
                        int kh, int kw, int pad, int stride) {
     int Hout = out_dim_r(H, kh, pad, stride);
     int Wout = out_dim_r(W, kw, pad, stride);
+
+    /* x: [Cin,H,W] -> xt: [H,W,Cin], contiguous over Cin (the reduction axis) */
+    float *xt = malloc((size_t)H * W * Cin * sizeof(float));
+    if (!xt) { fprintf(stderr, "OOM xt\n"); exit(1); }
+    for (int ci = 0; ci < Cin; ++ci)
+        for (int y = 0; y < H; ++y)
+            for (int xx = 0; xx < W; ++xx)
+                xt[(y * W + xx) * Cin + ci] = x[(ci * H + y) * W + xx];
+
+    /* wsign: [Cout,Cin,kh,kw] int8 -> wf: [Cout,kh,kw,Cin] float */
+    float *wf = malloc((size_t)Cout * kh * kw * Cin * sizeof(float));
+    if (!wf) { fprintf(stderr, "OOM wf\n"); exit(1); }
+    for (int co = 0; co < Cout; ++co)
+        for (int ci = 0; ci < Cin; ++ci)
+            for (int ky = 0; ky < kh; ++ky)
+                for (int kx = 0; kx < kw; ++kx)
+                    wf[((co * kh + ky) * kw + kx) * Cin + ci] =
+                        (float)wsign[((co * Cin + ci) * kh + ky) * kw + kx];
+
     for (int co = 0; co < Cout; ++co) {
         for (int oy = 0; oy < Hout; ++oy) {
+            int oyb = oy * stride - pad;
+            int ky0 = (oyb < 0) ? -oyb : 0;
+            int ky1 = (oyb + kh > H) ? (H - oyb) : kh;
             for (int ox = 0; ox < Wout; ++ox) {
+                int oxb = ox * stride - pad;
+                int kx0 = (oxb < 0) ? -oxb : 0;
+                int kx1 = (oxb + kw > W) ? (W - oxb) : kw;
                 float acc = 0.0f;
-                for (int ci = 0; ci < Cin; ++ci) {
-                    for (int ky = 0; ky < kh; ++ky) {
-                        int iy = oy * stride + ky - pad;
-                        if (iy < 0 || iy >= H) continue;
-                        for (int kx = 0; kx < kw; ++kx) {
-                            int ix = ox * stride + kx - pad;
-                            if (ix < 0 || ix >= W) continue;
-                            float xv = x[(ci * H + iy) * W + ix];
-                            int8_t wv = wsign[((co * Cin + ci) * kh + ky) * kw + kx];
-                            acc += (wv > 0 ? xv : -xv);
-                        }
+                for (int ky = ky0; ky < ky1; ++ky) {
+                    int iy = oyb + ky;
+                    for (int kx = kx0; kx < kx1; ++kx) {
+                        int ix = oxb + kx;
+                        const float *xv = xt + (iy * W + ix) * Cin;
+                        const float *wv = wf + ((co * kh + ky) * kw + kx) * Cin;
+                        float s = 0.0f;
+                        for (int ci = 0; ci < Cin; ++ci) s += xv[ci] * wv[ci];
+                        acc += s;
                     }
                 }
                 out[(co * Hout + oy) * Wout + ox] = alpha[co] * acc;
             }
         }
     }
+    free(xt); free(wf);
 }

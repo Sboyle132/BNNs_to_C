@@ -1,6 +1,9 @@
 /* bnn_model.c - blob loader + assembled forward (nearest-upsampler variant).
- * The forward mirrors python/verify/forward_driver.py::run_chain exactly. */
+ * The forward mirrors python/verify/forward_driver.py::run_chain exactly.
+ * Per-op timing is opt-in via bnn_prof.h: PROF(...) is a no-op without
+ * -DBNN_PROFILE, so the verified numerical path is byte-for-byte unchanged. */
 #include "bnn_model.h"
+#include "bnn_prof.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,12 +104,20 @@ static void act(const Act *a, const int32_t *P, const float *xreal,
         apply_fold_real(xreal, out, C, H, W, a->A, a->B, a->slope, a->rsign);
 }
 
-/* binary conv (+-1 in) then integer fold -> +-1 out */
-static int8_t *bin_conv_act(const Conv *c, const Act *a, const int8_t *in, int H, int W) {
+/* binary conv (+-1 in) then integer fold -> +-1 out. `tag` names the stage
+ * for the profiler (e.g. "enc2.c1" -> rows "enc2.c1.conv" / "enc2.c1.act"). */
+static int8_t *bin_conv_act(const Conv *c, const Act *a, const int8_t *in,
+                            int H, int W, const char *tag) {
+    char lb[48];
+    (void)tag;  /* used only by PLABEL under -DBNN_PROFILE */
     int32_t *P = xmalloc((size_t)c->Cout * H * W * sizeof(int32_t));
-    bconv_xnor(in, c->packed, P, c->Cin, H, W, c->Cout, c->kh, c->kw, c->pad, c->stride);
+    PROF(PLABEL(lb, "%s.conv", tag), "bconv",
+         (double)c->Cout * H * W, (double)c->Cin * c->kh * c->kw,
+         bconv_xnor(in, c->packed, P, c->Cin, H, W, c->Cout, c->kh, c->kw, c->pad, c->stride));
     int8_t *out = xmalloc((size_t)c->Cout * H * W);
-    act(a, P, NULL, out, c->Cout, H, W);
+    PROF(PLABEL(lb, "%s.act", tag), "fold",
+         (double)c->Cout * H * W, 0.0,
+         act(a, P, NULL, out, c->Cout, H, W));
     free(P);
     return out;
 }
@@ -137,54 +148,77 @@ static int8_t *up_cat(const int8_t *skip, int sC, int sH, int sW,
 }
 
 void bnn_forward(const Model *m, const float *input, int H, int W, float *logits) {
+    prof_reset();
     int8_t *skip[4]; int skipC[4], skipH[4], skipW[4];
+    char lbl[24];
 
     /* ---- enc1 (real first conv) ---- */
     int8_t *x; int xC, xH, xW;
     {
         const Conv *c1 = &m->enc_conv1[0];
         float *co1 = xmalloc((size_t)c1->Cout * H * W * sizeof(float));
-        conv_realin_naive(input, c1->wsign, c1->alpha, co1,
-                          c1->Cin, H, W, c1->Cout, c1->kh, c1->kw, c1->pad, c1->stride);
+        PROF("enc1.conv1", "conv_real",
+             (double)c1->Cout * H * W, (double)c1->Cin * c1->kh * c1->kw,
+             conv_realin_naive(input, c1->wsign, c1->alpha, co1,
+                               c1->Cin, H, W, c1->Cout, c1->kh, c1->kw, c1->pad, c1->stride));
         int8_t *a1 = xmalloc((size_t)c1->Cout * H * W);
-        act(&m->enc_act1[0], NULL, co1, a1, c1->Cout, H, W);
+        PROF("enc1.act1", "fold", (double)c1->Cout * H * W, 0.0,
+             act(&m->enc_act1[0], NULL, co1, a1, c1->Cout, H, W));
         free(co1);
         const Conv *c2 = &m->enc_conv2[0];
         int32_t *P2 = xmalloc((size_t)c2->Cout * H * W * sizeof(int32_t));
-        bconv_xnor(a1, c2->packed, P2, c2->Cin, H, W, c2->Cout, c2->kh, c2->kw, c2->pad, c2->stride);
+        PROF("enc1.conv2", "bconv",
+             (double)c2->Cout * H * W, (double)c2->Cin * c2->kh * c2->kw,
+             bconv_xnor(a1, c2->packed, P2, c2->Cin, H, W, c2->Cout, c2->kh, c2->kw, c2->pad, c2->stride));
         free(a1);
         skip[0] = xmalloc((size_t)c2->Cout * H * W);
-        act(&m->enc_act2_skip[0], P2, NULL, skip[0], c2->Cout, H, W);
+        PROF("enc1.skip", "fold", (double)c2->Cout * H * W, 0.0,
+             act(&m->enc_act2_skip[0], P2, NULL, skip[0], c2->Cout, H, W));
         skipC[0] = c2->Cout; skipH[0] = H; skipW[0] = W;
         int Hh = H / 2, Wh = W / 2;
         int32_t *Pd = xmalloc((size_t)c2->Cout * Hh * Wh * sizeof(int32_t));
-        maxpool_P(P2, Pd, c2->Cout, H, W, 2, 2); free(P2);
+        PROF("enc1.pool", "maxpool", (double)c2->Cout * Hh * Wh, 4.0,
+             maxpool_P(P2, Pd, c2->Cout, H, W, 2, 2));
+        free(P2);
         x = xmalloc((size_t)c2->Cout * Hh * Wh);
-        act(&m->enc_act2_down[0], Pd, NULL, x, c2->Cout, Hh, Wh); free(Pd);
+        PROF("enc1.down", "fold", (double)c2->Cout * Hh * Wh, 0.0,
+             act(&m->enc_act2_down[0], Pd, NULL, x, c2->Cout, Hh, Wh));
+        free(Pd);
         xC = c2->Cout; xH = Hh; xW = Wh;
     }
     /* ---- enc2..4 (binary) ---- */
     for (int i = 1; i < 4; ++i) {
-        int8_t *h = bin_conv_act(&m->enc_conv1[i], &m->enc_act1[i], x, xH, xW);
+        int8_t *h = bin_conv_act(&m->enc_conv1[i], &m->enc_act1[i], x, xH, xW,
+                                 PLABEL(lbl, "enc%d.c1", i + 1));
         free(x);
         const Conv *c2 = &m->enc_conv2[i];
         int32_t *P2 = xmalloc((size_t)c2->Cout * xH * xW * sizeof(int32_t));
-        bconv_xnor(h, c2->packed, P2, c2->Cin, xH, xW, c2->Cout, c2->kh, c2->kw, c2->pad, c2->stride);
+        PROF(PLABEL(lbl, "enc%d.c2", i + 1), "bconv",
+             (double)c2->Cout * xH * xW, (double)c2->Cin * c2->kh * c2->kw,
+             bconv_xnor(h, c2->packed, P2, c2->Cin, xH, xW, c2->Cout, c2->kh, c2->kw, c2->pad, c2->stride));
         free(h);
         skip[i] = xmalloc((size_t)c2->Cout * xH * xW);
-        act(&m->enc_act2_skip[i], P2, NULL, skip[i], c2->Cout, xH, xW);
+        PROF(PLABEL(lbl, "enc%d.skip", i + 1), "fold",
+             (double)c2->Cout * xH * xW, 0.0,
+             act(&m->enc_act2_skip[i], P2, NULL, skip[i], c2->Cout, xH, xW));
         skipC[i] = c2->Cout; skipH[i] = xH; skipW[i] = xW;
         int Hh = xH / 2, Wh = xW / 2;
         int32_t *Pd = xmalloc((size_t)c2->Cout * Hh * Wh * sizeof(int32_t));
-        maxpool_P(P2, Pd, c2->Cout, xH, xW, 2, 2); free(P2);
+        PROF(PLABEL(lbl, "enc%d.pool", i + 1), "maxpool",
+             (double)c2->Cout * Hh * Wh, 4.0,
+             maxpool_P(P2, Pd, c2->Cout, xH, xW, 2, 2));
+        free(P2);
         x = xmalloc((size_t)c2->Cout * Hh * Wh);
-        act(&m->enc_act2_down[i], Pd, NULL, x, c2->Cout, Hh, Wh); free(Pd);
+        PROF(PLABEL(lbl, "enc%d.down", i + 1), "fold",
+             (double)c2->Cout * Hh * Wh, 0.0,
+             act(&m->enc_act2_down[i], Pd, NULL, x, c2->Cout, Hh, Wh));
+        free(Pd);
         xC = c2->Cout; xH = Hh; xW = Wh;
     }
     /* ---- bottleneck ---- */
     {
-        int8_t *h = bin_conv_act(&m->bott_conv1, &m->bott_act1, x, xH, xW); free(x);
-        x = bin_conv_act(&m->bott_conv2, &m->bott_act2, h, xH, xW); free(h);
+        int8_t *h = bin_conv_act(&m->bott_conv1, &m->bott_act1, x, xH, xW, "bott.c1"); free(x);
+        x = bin_conv_act(&m->bott_conv2, &m->bott_act2, h, xH, xW, "bott.c2"); free(h);
         xC = m->bott_conv2.Cout;  /* xH,xW unchanged */
     }
     /* ---- decoder dec4..dec1 ---- */
@@ -192,10 +226,15 @@ void bnn_forward(const Model *m, const float *input, int H, int W, float *logits
         int si = 3 - i;                 /* dec4<-s4(enc3 idx3)... skip[3-i] */
         int H2 = skipH[si], W2 = skipW[si];
         int catC;
-        int8_t *cat = up_cat(skip[si], skipC[si], H2, W2, x, xC, xH, xW, &catC);
+        int8_t *cat;
+        PROF(PLABEL(lbl, "dec%d.upcat", 4 - i), "upcat",
+             (double)(skipC[si] + xC) * H2 * W2, 0.0,
+             cat = up_cat(skip[si], skipC[si], H2, W2, x, xC, xH, xW, &catC));
         free(x); free(skip[si]);
-        int8_t *h = bin_conv_act(&m->dec_conv1[i], &m->dec_act1[i], cat, H2, W2); free(cat);
-        x = bin_conv_act(&m->dec_conv2[i], &m->dec_act2[i], h, H2, W2); free(h);
+        int8_t *h = bin_conv_act(&m->dec_conv1[i], &m->dec_act1[i], cat, H2, W2,
+                                 PLABEL(lbl, "dec%d.c1", 4 - i)); free(cat);
+        x = bin_conv_act(&m->dec_conv2[i], &m->dec_act2[i], h, H2, W2,
+                         PLABEL(lbl, "dec%d.c2", 4 - i)); free(h);
         xC = m->dec_conv2[i].Cout; xH = H2; xW = W2;
     }
     /* ---- head ---- */
@@ -203,8 +242,11 @@ void bnn_forward(const Model *m, const float *input, int H, int W, float *logits
     {
         long n = (long)xC * xH * xW;
         float *xf = xmalloc(n * sizeof(float));
-        for (long j = 0; j < n; ++j) xf[j] = (float)x[j];
-        head_1x1(xf, m->head_W, m->head_bias, logits, m->head_Cin, xH, xW, m->head_Cout);
+        PROF("head.widen", "widen", (double)n, 0.0,
+             { for (long j = 0; j < n; ++j) xf[j] = (float)x[j]; });
+        PROF("head", "head",
+             (double)m->head_Cout * xH * xW, (double)m->head_Cin,
+             head_1x1(xf, m->head_W, m->head_bias, logits, m->head_Cin, xH, xW, m->head_Cout));
         free(xf);
     }
     free(x);
