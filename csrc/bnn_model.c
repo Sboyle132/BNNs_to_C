@@ -113,7 +113,7 @@ static int8_t *bin_conv_act(const Conv *c, const Act *a, const int8_t *in,
     int32_t *P = xmalloc((size_t)c->Cout * H * W * sizeof(int32_t));
     PROF(PLABEL(lb, "%s.conv", tag), "bconv",
          (double)c->Cout * H * W, (double)c->Cin * c->kh * c->kw,
-         bconv_xnor(in, c->packed, P, c->Cin, H, W, c->Cout, c->kh, c->kw, c->pad, c->stride));
+         bconv_dispatch(in, c->packed, P, c->Cin, H, W, c->Cout, c->kh, c->kw, c->pad, c->stride));
     int8_t *out = xmalloc((size_t)c->Cout * H * W);
     PROF(PLABEL(lb, "%s.act", tag), "fold",
          (double)c->Cout * H * W, 0.0,
@@ -169,7 +169,7 @@ void bnn_forward(const Model *m, const float *input, int H, int W, float *logits
         int32_t *P2 = xmalloc((size_t)c2->Cout * H * W * sizeof(int32_t));
         PROF("enc1.conv2", "bconv",
              (double)c2->Cout * H * W, (double)c2->Cin * c2->kh * c2->kw,
-             bconv_xnor(a1, c2->packed, P2, c2->Cin, H, W, c2->Cout, c2->kh, c2->kw, c2->pad, c2->stride));
+             bconv_dispatch(a1, c2->packed, P2, c2->Cin, H, W, c2->Cout, c2->kh, c2->kw, c2->pad, c2->stride));
         free(a1);
         skip[0] = xmalloc((size_t)c2->Cout * H * W);
         PROF("enc1.skip", "fold", (double)c2->Cout * H * W, 0.0,
@@ -195,7 +195,7 @@ void bnn_forward(const Model *m, const float *input, int H, int W, float *logits
         int32_t *P2 = xmalloc((size_t)c2->Cout * xH * xW * sizeof(int32_t));
         PROF(PLABEL(lbl, "enc%d.c2", i + 1), "bconv",
              (double)c2->Cout * xH * xW, (double)c2->Cin * c2->kh * c2->kw,
-             bconv_xnor(h, c2->packed, P2, c2->Cin, xH, xW, c2->Cout, c2->kh, c2->kw, c2->pad, c2->stride));
+             bconv_dispatch(h, c2->packed, P2, c2->Cin, xH, xW, c2->Cout, c2->kh, c2->kw, c2->pad, c2->stride));
         free(h);
         skip[i] = xmalloc((size_t)c2->Cout * xH * xW);
         PROF(PLABEL(lbl, "enc%d.skip", i + 1), "fold",

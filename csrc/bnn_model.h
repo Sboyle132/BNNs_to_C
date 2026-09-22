@@ -7,6 +7,10 @@
 /* ---- kernels (defined in the other .c files) ---- */
 void bconv_xnor(const int8_t *a, const uint64_t *packed_w, int32_t *P,
                 int Cin, int H, int W, int Cout, int kh, int kw, int pad, int stride);
+void bconv_xnor_packed(const int8_t *a, const uint64_t *packed_w, int32_t *P,
+                int Cin, int H, int W, int Cout, int kh, int kw, int pad, int stride);
+void bconv_dispatch(const int8_t *a, const uint64_t *packed_w, int32_t *P,
+                int Cin, int H, int W, int Cout, int kh, int kw, int pad, int stride);
 void conv_realin_naive(const float *x, const int8_t *wsign, const float *alpha,
                        float *out, int Cin, int H, int W, int Cout,
                        int kh, int kw, int pad, int stride);
