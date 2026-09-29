@@ -50,9 +50,22 @@ static inline int out_dim_r(int in, int k, int pad, int stride) {
     return (in + 2 * pad - k) / stride + 1;
 }
 
-void conv_realin_naive(const float *x, const int8_t *wsign, const float *alpha,
-                       float *out, int Cin, int H, int W, int Cout,
-                       int kh, int kw, int pad, int stride) {
+/* conv_realin_general - the original transposed path (v2). BYTE-FOR-BYTE THE
+ * SAME BODY as before this split (diagnostic sub-instrumentation removed
+ * after doing its job -- see history below); only the name changed, so k=3
+ * callers (v1's enc1.conv1) see identical behaviour, still routed here via
+ * the conv_realin_naive dispatcher below. Reports as one row under the
+ * caller's own PROF span (e.g. "enc1.conv1"), same as every other op.
+ *
+ * History: a since-removed per-stage PROF split (transpose_x/transpose_w/
+ * compute) established that this transpose -- fixed at O(H*W*Cin) and
+ * O(Cout*kh*kw*Cin), independent of kh*kw -- is ~12% of this function's own
+ * time at k=3 (negligible, as the v2 docstring below claims) but ~37% at
+ * k=1, which is why conv_realin_1x1 exists below for that shape and needs no
+ * transpose at all. */
+void conv_realin_general(const float *x, const int8_t *wsign, const float *alpha,
+                         float *out, int Cin, int H, int W, int Cout,
+                         int kh, int kw, int pad, int stride) {
     int Hout = out_dim_r(H, kh, pad, stride);
     int Wout = out_dim_r(W, kw, pad, stride);
 
@@ -100,4 +113,60 @@ void conv_realin_naive(const float *x, const int8_t *wsign, const float *alpha,
         }
     }
     free(xt); free(wf);
+}
+
+/* conv_realin_1x1 - fast path for kh=kw=1, pad=0, stride=1 (the spectral
+ * stem's 1x1 reduction conv). NO transpose needed for either array:
+ *   - wsign[co,ci,0,0] is already Cin-contiguous per co (kh=kw=1 collapses
+ *     the last two dims to nothing), so w needs no reshuffle at all.
+ *   - x[ci,:] is already one contiguous H*W block per ci in the ORIGINAL
+ *     [Cin,H,W] layout -- so instead of transposing x to make a per-pixel
+ *     dot product contiguous, the reduction is restructured as a sum of
+ *     Cin rank-1 updates over the whole pixel plane at once:
+ *         out[co,:] = alpha[co] * sum_ci w[co,ci] * x[ci,:]
+ *     Each inner step (out[co,:] += w[co,ci]*x[ci,:]) is a plain contiguous
+ *     streaming multiply-add over H*W elements -- the auto-vectorizer's
+ *     easiest possible case, no gather/scatter, no transpose buffers.
+ * Mathematically identical to conv_realin_general at this shape (same sum,
+ * different order/associativity -- float summation-order noise only, same
+ * tolerance class as the v1->v2 transpose optimisation's own ~2e-6 diff).
+ * Verified against conv_realin_general as the oracle (bit-exact, 10
+ * synthetic shapes incl. the real capture size). Reports as one row under
+ * the caller's own PROF span (e.g. "stem.conv"), same convention as
+ * conv_realin_general -- an earlier internal prof_add here double-counted
+ * against that outer span (removed once it had nothing left to break down,
+ * same reasoning as conv_realin_general's own removed sub-instrumentation
+ * above). */
+void conv_realin_1x1(const float *x, const int8_t *wsign, const float *alpha,
+                     float *out, int Cin, int H, int W, int Cout) {
+    long HW = (long)H * W;
+    for (int co = 0; co < Cout; ++co) {
+        float *orow = out + (long)co * HW;
+        for (long p = 0; p < HW; ++p) orow[p] = 0.0f;
+        const int8_t *wrow = wsign + (long)co * Cin;   /* Cin-contiguous, kh=kw=1 */
+        for (int ci = 0; ci < Cin; ++ci) {
+            float wv = (float)wrow[ci];
+            const float *xrow = x + (long)ci * HW;      /* contiguous H*W block */
+            for (long p = 0; p < HW; ++p) orow[p] += wv * xrow[p];
+        }
+        float a = alpha[co];
+        for (long p = 0; p < HW; ++p) orow[p] *= a;
+    }
+}
+
+
+/* conv_realin_naive - DISPATCHER, same name/signature every existing caller
+ * (bnn_model.c, bnn_model_stem.c) already uses, so NEITHER file needs any
+ * change: k=3 (v1's enc1.conv1) is routed to the untouched conv_realin_general
+ * exactly as before this split; k=1,pad=0,stride=1 (the stem's 1x1) is
+ * routed to the new fast path automatically. No flag, no config, nothing to
+ * remember to set -- the shape alone decides, same pattern bconv_dispatch
+ * already uses to pick the packed vs dense binary-conv kernel by Cin. */
+void conv_realin_naive(const float *x, const int8_t *wsign, const float *alpha,
+                       float *out, int Cin, int H, int W, int Cout,
+                       int kh, int kw, int pad, int stride) {
+    if (kh == 1 && kw == 1 && pad == 0 && stride == 1)
+        conv_realin_1x1(x, wsign, alpha, out, Cin, H, W, Cout);
+    else
+        conv_realin_general(x, wsign, alpha, out, Cin, H, W, Cout, kh, kw, pad, stride);
 }

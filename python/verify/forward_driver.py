@@ -262,6 +262,82 @@ def run_chain(model, golden, libs, x_input):
     return G
 
 
+def run_chain_stem(model, golden, libs, x_input):
+    """run_chain for the spectral-stem (A1b) model. A real-input 1x1 binary
+    stem (pad=0) runs first and binarises to +-1; the whole encoder (INCLUDING
+    enc1) is then pure XNOR. Body modules live under 'body.', the stem under
+    'stem.'. force_real is {the stem act} only. The verified v1 run_chain above
+    is left completely untouched.
+
+    NOTE the stem conv is 1x1/pad=0, so it calls RI.run_realin with pad=0
+    directly rather than the conv_realin() helper (which hardcodes pad=1 for
+    the 3x3 v1 first layer)."""
+    bclib, rilib, mplib, hdlib, foldlib = libs
+    named = dict(model.named_modules())
+    bp = "body." if "body.enc1.conv1" in named else ""
+
+    stem_conv_name = next(
+        n for n, m in model.named_modules()
+        if n.split(".", 1)[0] == "stem"
+        and type(m).__name__ in ("HardBinaryConv", "RealConv", "Conv2d")
+        and getattr(m, "weight", None) is not None and m.weight.dim() == 4)
+    stem_act_name = next(
+        n for n, m in model.named_modules()
+        if n.split(".", 1)[0] == "stem" and type(m).__name__ == "ActBlock")
+
+    # structural: ONLY the stem act is a real accumulator; enc1.act1 is integer.
+    rules = build_rules(model, golden, force_real={stem_act_name})
+    G = {}
+
+    def enc(name, x_pm1):
+        blk = named[name]
+        P1 = conv_xnor_P(bclib, x_pm1, wsign_of(blk.conv1))
+        a1 = apply_act(foldlib, P1, rules[f"{name}.act1"])
+        G[f"{name}.act1"] = a1
+        P2 = conv_xnor_P(bclib, a1, wsign_of(blk.conv2))
+        skip = apply_act(foldlib, P2, rules[f"{name}.act2_skip"])
+        Pd = MP.run_maxpool(mplib, P2)
+        down = apply_act(foldlib, Pd, rules[f"{name}.act2_down"])
+        G[f"{name}.act2_skip"] = skip
+        G[f"{name}.act2_down"] = down
+        return skip, down
+
+    def plain(name, x_pm1):
+        blk = named[name]
+        P1 = conv_xnor_P(bclib, x_pm1, wsign_of(blk.conv1))
+        a1 = apply_act(foldlib, P1, rules[f"{name}.act1"])
+        P2 = conv_xnor_P(bclib, a1, wsign_of(blk.conv2))
+        a2 = apply_act(foldlib, P2, rules[f"{name}.act2"])
+        G[f"{name}.act1"] = a1
+        G[f"{name}.act2"] = a2
+        return a2
+
+    # --- stem: real-input 1x1 binary-weight conv (pad=0) -> real fold -> +-1 ---
+    sc = named[stem_conv_name]
+    sw = wsign_of(sc)
+    salpha = np.abs(sc.weight.detach().cpu().numpy()).mean(axis=(1, 2, 3)).astype(np.float32)
+    co = RI.run_realin(rilib, x_input[0].astype(np.float32), sw, salpha, pad=0, stride=1)
+    x = apply_act(foldlib, co, rules[stem_act_name])
+
+    s1, x = enc(bp + "enc1", x)
+    s2, x = enc(bp + "enc2", x)
+    s3, x = enc(bp + "enc3", x)
+    s4, x = enc(bp + "enc4", x)
+    x = plain(bp + "bottleneck", x)
+    x = plain(bp + "dec4", nearest_up_cat(s4, x))
+    x = plain(bp + "dec3", nearest_up_cat(s3, x))
+    x = plain(bp + "dec2", nearest_up_cat(s2, x))
+    x = plain(bp + "dec1", nearest_up_cat(s1, x))
+
+    outc = model.body.outc if bp else model.outc
+    W = outc.weight.detach().cpu().numpy()[:, :, 0, 0]
+    bias = outc.bias.detach().cpu().numpy()
+    logits = HD.run_head(hdlib, x.astype(np.float32), W, bias)
+    G["logits"] = logits
+    return G
+
+
+
 def capture_golden(model, x):
     """Run the model once, capturing each conv output and each activation
     (BinaryActivation) output, plus final logits."""

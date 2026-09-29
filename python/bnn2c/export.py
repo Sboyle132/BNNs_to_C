@@ -1,16 +1,25 @@
 """export.py - export a trained BNN checkpoint to weights.blob for the C engine.
 
-Loads the model + checkpoint via the same loader the verification tools use,
-derives the per-channel activation fold rules (verified 22/22 by
-derive_thresholds), packs binary weights, and writes the blob. Self-checks by
-reading the blob back and asserting it round-trips.
+Handles BOTH:
+  * the original bireal models (no stem)          -> v1 blob -> bnn_infer
+  * the spectral-stem A1b variant (--stem a1b)    -> v2 blob -> bnn_infer_stem
 
+blob.write_blob auto-selects v1/v2 from the model (presence of a stem), so the
+only thing --stem changes here is HOW THE MODEL IS BUILT: the stem wrapper
+needs stem_weight/stem_out flags that the generic loader does not pass, so the
+A1b model is constructed directly. The v1 path is unchanged.
+
+  # v1 (unchanged):
   python3 export.py \
       --model-module models.bnn_unet_cpba_a2_dualskip_bireal_student \
       --model-class  BNN_UNet_CPBA_A2_DualSkip_BiReal_Student \
       --checkpoint   runs/.../best_model.pt \
-      --upsampler    nearest \
-      --out          artifacts/weights.blob
+      --upsampler    nearest --out artifacts/weights.blob
+
+  # v2 (spectral stem A1b):
+  python3 export.py --stem a1b \
+      --checkpoint runs/bnn_unet_cpba_a2_dualskip_fp32_wbin_abin_stem/best_model.pt \
+      --stem-channels 16 --out artifacts/weights_stem.blob
 """
 
 import argparse
@@ -38,7 +47,7 @@ def _snap_zero_weights(model, eps=1e-6):
     """Set any exact-zero HardBinaryConv weight to +eps so sign()->+1. Returns
     count snapped. XNOR-popcount is 1-bit and cannot represent a 0 weight; the
     model's sign(0)=0 would otherwise make the C accumulator differ by 1 at
-    every output pixel of the affected channel."""
+    every output pixel of the affected channel. Covers stem AND body convs."""
     import torch
     n = 0
     with torch.no_grad():
@@ -52,10 +61,31 @@ def _snap_zero_weights(model, eps=1e-6):
     return n
 
 
+def _load_checkpoint_direct(model, path):
+    import torch
+    sd = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(sd, dict) and "state_dict" in sd:
+        sd = sd["state_dict"]
+    model.load_state_dict(sd, strict=True)
+
+
+def _build_stem_a1b(args):
+    """Construct the A1b spectral-stem model with the correct (non-default)
+    stem flags, which the generic loader cannot pass."""
+    from models.bnn_unet_cpba_a2_dualskip_bireal_stem import (
+        BNN_UNet_CPBA_A2_DualSkip_BiReal_Stem as Stem)
+    model = Stem(n_bands=args.n_bands, n_classes=args.n_classes,
+                 base_channels=args.base_channels,
+                 stem_channels=args.stem_channels, stem_layers=1,
+                 stem_weight="binary", stem_out="binary", stem_act="prelu")
+    _load_checkpoint_direct(model, args.checkpoint)
+    return model
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-module", required=True)
-    ap.add_argument("--model-class", required=True)
+    ap.add_argument("--model-module")
+    ap.add_argument("--model-class")
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--upsampler", default="nearest",
                     choices=["nearest", "pixshuf", "nnrefine"])
@@ -66,29 +96,36 @@ def main():
     ap.add_argument("--n-classes", type=int, default=3)
     ap.add_argument("--base-channels", type=int, default=16)
     ap.add_argument("--patch", type=int, default=32)
+    # spectral-stem variant
+    ap.add_argument("--stem", choices=["none", "a1b"], default="none",
+                    help="'a1b' builds the binary-weight binarised-output "
+                         "spectral-stem model (writes a v2 blob)")
+    ap.add_argument("--stem-channels", type=int, default=16)
     args = ap.parse_args()
 
-    from dump_model_spec import load_real_model
-    ns = SimpleNamespace(
-        model_module=args.model_module, model_class=args.model_class,
-        use_registry=args.use_registry, config=args.config,
-        checkpoint=args.checkpoint, input_npy=None,
-        n_bands=args.n_bands, n_classes=args.n_classes,
-        base_channels=args.base_channels, patch=args.patch)
-    model, _ = load_real_model(ns)
+    import torch
+
+    if args.stem == "a1b":
+        model = _build_stem_a1b(args)
+    else:
+        from dump_model_spec import load_real_model
+        ns = SimpleNamespace(
+            model_module=args.model_module, model_class=args.model_class,
+            use_registry=args.use_registry, config=args.config,
+            checkpoint=args.checkpoint, input_npy=None,
+            n_bands=args.n_bands, n_classes=args.n_classes,
+            base_channels=args.base_channels, patch=args.patch)
+        model, _ = load_real_model(ns)
     model.eval()
 
     # sign(0)=0 in HardBinaryConv, but XNOR-popcount is 1-bit. Snap any exact-
     # zero weights to a tiny +epsilon IN THE MODEL so every derived quantity
-    # (alpha, fold thresholds, the C accumulator) sees the same +1 sign and
-    # stays mutually consistent. Verify the snap doesn't change the argmax.
-    import torch
+    # (alpha, fold thresholds, the C accumulator) sees the same +1 sign.
     n_snapped = _snap_zero_weights(model)
     if n_snapped:
         print(f"snapped {n_snapped} exact-zero weight(s) to +1 (XNOR cannot "
-              f"represent 0); argmax-unchanged check runs below")
+              f"represent 0)")
 
-    import os
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     BLOB.write_blob(model, args.out, upsampler=args.upsampler,
                     n_bands=args.n_bands, patch=args.patch)
@@ -98,10 +135,23 @@ def main():
     assert b["n_bands"] == args.n_bands and b["n_classes"] == args.n_classes
     assert len(b["convs"]) == 18 and len(b["acts"]) == 22
     size = os.path.getsize(args.out)
-    print(f"wrote {args.out}  ({size:,} bytes)")
-    print(f"  base_channels={b['base_channels']} n_bands={b['n_bands']} "
-          f"n_classes={b['n_classes']} upsampler={args.upsampler}")
-    print(f"  18 convs, 22 activation folds, round-trip OK")
+    if b["version"] == BLOB.VERSION_STEM:
+        assert b["has_stem"] == 1 and b["n_stem_layers"] == 1
+        assert b["stem_conv"]["tag"] == "real" and b["stem_conv"]["kh"] == 1
+        assert b["stem_act"]["kind"] == "real"
+        assert b["convs"][0]["tag"] == "bin", "enc1.conv1 should be BIN in A1b"
+        assert b["acts"][0]["kind"] == "int", "enc1.act1 should be INT in A1b"
+        print(f"wrote {args.out}  ({size:,} bytes)  [v2 spectral-stem A1b]")
+        print(f"  base_channels={b['base_channels']} n_bands={b['n_bands']} "
+              f"n_classes={b['n_classes']} stem_channels={args.stem_channels} "
+              f"upsampler={args.upsampler}")
+        print(f"  stem: 1x1 real-input binary conv + real fold; "
+              f"enc1 role-swap OK; 18 convs, 22 folds, round-trip OK")
+    else:
+        print(f"wrote {args.out}  ({size:,} bytes)  [v1]")
+        print(f"  base_channels={b['base_channels']} n_bands={b['n_bands']} "
+              f"n_classes={b['n_classes']} upsampler={args.upsampler}")
+        print(f"  18 convs, 22 activation folds, round-trip OK")
 
 
 if __name__ == "__main__":

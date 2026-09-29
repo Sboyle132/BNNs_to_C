@@ -130,9 +130,11 @@ def infer_torch(model, cube):
     return logits[:, :H, :W]
 
 
-def infer_c(model, cube):
+def infer_c(model, cube, stem=False):
     """Run the full capture through the C engine by reusing forward_driver's
-    chained C ops (which are the same kernels the standalone binary uses)."""
+    chained C ops (which are the same kernels the standalone binary uses).
+    stem=True routes to run_chain_stem (spectral-stem A1b); the default v1 path
+    is unchanged."""
     import torch
     import forward_driver as FD
     import bconv_harness as BC, realin_conv_harness as RI
@@ -140,7 +142,8 @@ def infer_c(model, cube):
     cp, H, W = pad_to_16(cube)
     libs = (BC.build(), RI.build(), MP.build(), HD.build(), FD.build_fold())
     golden = FD.capture_golden(model, torch.from_numpy(cp[None]).float())
-    G = FD.run_chain(model, golden, libs, cp[None])
+    runner = FD.run_chain_stem if stem else FD.run_chain
+    G = runner(model, golden, libs, cp[None])
     return G["logits"][:, :H, :W]
 
 
@@ -184,10 +187,14 @@ def write_outputs(out_dir, seg, gt):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-module", required=True)
-    ap.add_argument("--model-class", required=True)
+    ap.add_argument("--model-module")
+    ap.add_argument("--model-class")
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--config", required=True)
+    ap.add_argument("--stem", choices=["none", "a1b"], default="none",
+                    help="'a1b' builds the spectral-stem model and runs the "
+                         "stem C forward (run_chain_stem)")
+    ap.add_argument("--stem-channels", type=int, default=16)
     ap.add_argument("--project-dir", default=os.environ.get("HYPSO_REPO", "."))
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--split", choices=["test", "val", "train"])
@@ -209,21 +216,37 @@ def main():
     import yaml
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    model_name = args.model_name or args.model_class
+    model_name = (args.model_name or args.model_class
+                  or ("stem_a1b" if args.stem != "none" else "model"))
 
     # build model
-    from dump_model_spec import load_real_model
-    from types import SimpleNamespace
-    ns = SimpleNamespace(model_module=args.model_module, model_class=args.model_class,
-                         use_registry=False, config=args.config, checkpoint=args.checkpoint,
-                         input_npy=None, n_bands=args.n_bands, n_classes=args.n_classes,
-                         base_channels=16, patch=args.patch)
-    model, _ = load_real_model(ns)
+    import torch
+    if args.stem == "a1b":
+        from models.bnn_unet_cpba_a2_dualskip_bireal_stem import (
+            BNN_UNet_CPBA_A2_DualSkip_BiReal_Stem as _Stem)
+        model = _Stem(n_bands=args.n_bands, n_classes=args.n_classes,
+                      base_channels=16, stem_channels=args.stem_channels,
+                      stem_layers=1, stem_weight="binary", stem_out="binary",
+                      stem_act="prelu")
+        _sd = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        if isinstance(_sd, dict) and "state_dict" in _sd:
+            _sd = _sd["state_dict"]
+        model.load_state_dict(_sd, strict=True)
+    else:
+        if not (args.model_module and args.model_class):
+            raise SystemExit("--model-module and --model-class are required "
+                             "unless --stem a1b is given")
+        from dump_model_spec import load_real_model
+        from types import SimpleNamespace
+        ns = SimpleNamespace(model_module=args.model_module, model_class=args.model_class,
+                             use_registry=False, config=args.config, checkpoint=args.checkpoint,
+                             input_npy=None, n_bands=args.n_bands, n_classes=args.n_classes,
+                             base_channels=16, patch=args.patch)
+        model, _ = load_real_model(ns)
     model.eval()
     # snap exact-zero weights to +eps so sign()->+1 everywhere: the model
     # forward (reference) and the C engine (XNOR, 1-bit) then agree. Rare
     # artifact (~0-1 weights); negligible effect, verified by --verify.
-    import torch
     with torch.no_grad():
         _nz = 0
         for _m in model.modules():
@@ -249,7 +272,7 @@ def main():
         cube, gt = load_capture_cube(cfg, args.project_dir, index, normaliser,
                                      band_indices, cid)
         if args.verify:
-            lt = infer_torch(model, cube); lc = infer_c(model, cube)
+            lt = infer_torch(model, cube); lc = infer_c(model, cube, stem=(args.stem != "none"))
             st, sc = lt.argmax(0), lc.argmax(0)
             agree = float((st == sc).mean())
             ndis = int((st != sc).sum())
@@ -273,7 +296,8 @@ def main():
             tag = (f"verify OK (argmax {agree*100:.3f}%, {ndis} float-boundary "
                    f"px within tol)")
         else:
-            logits = infer_c(model, cube) if args.backend == "c" else infer_torch(model, cube)
+            logits = (infer_c(model, cube, stem=(args.stem != "none"))
+                      if args.backend == "c" else infer_torch(model, cube))
             seg = logits.argmax(0)
             tag = f"backend={args.backend}"
         out_dir = os.path.join(args.out_root, cid, model_name)

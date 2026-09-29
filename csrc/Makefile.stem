@@ -1,0 +1,39 @@
+# Makefile.stem - build the spectral-stem (A1b) engine, reusing the verified
+# v1 kernel sources. PARALLEL to the v1 Makefile; run with
+#   make -f Makefile.stem            # plain build -> bnn_infer_stem
+#   make -f Makefile.stem profile    # -DBNN_PROFILE build -> bnn_infer_stem_prof
+# The v1 `make` / `make profile` and their binaries are untouched.
+#
+# bnn_prof.c is linked into BOTH targets: prof_now() is used unconditionally
+# for coarse (load/forward/write) timing in main_stem.c, same as main.c. Only
+# the per-op PROF(...) records are gated by -DBNN_PROFILE (see bnn_prof.h);
+# without it PROF expands to just the wrapped call, so the plain
+# bnn_infer_stem binary's numerical path is byte-for-byte unaffected by this
+# file existing.
+
+CC      ?= gcc
+CFLAGS  ?= -O3 -march=native -fopenmp -Wall -Wextra
+LDFLAGS ?= -fopenmp -lm
+
+KERNELS = bnn_conv.c bnn_conv_realin.c bnn_maxpool.c bnn_fold.c bnn_head.c bnn_prof.c
+STEM    = bnn_model_stem.c main_stem.c
+SRC     = $(KERNELS) $(STEM)
+
+bnn_infer_stem: $(SRC) bnn_model_stem.h bnn_prof.h
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+
+profile: CFLAGS += -DBNN_PROFILE
+profile: bnn_infer_stem_prof
+
+bnn_infer_stem_prof: $(SRC) bnn_model_stem.h bnn_prof.h
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+
+# ARM cross-compile (mirror the v1 target; adjust triple/flags as needed).
+CROSS_CC ?= arm-linux-gnueabihf-gcc
+bnn_infer_stem_arm: $(SRC) bnn_model_stem.h bnn_prof.h
+	$(CROSS_CC) -O3 -fopenmp -Wall -o $@ $(SRC) -fopenmp -lm
+
+clean:
+	rm -f bnn_infer_stem bnn_infer_stem_prof bnn_infer_stem_arm
+
+.PHONY: clean profile

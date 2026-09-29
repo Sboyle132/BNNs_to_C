@@ -1,6 +1,18 @@
 """blob.py - single source of truth for the weights.blob binary layout.
 Writer (write_blob) and reader (read_blob) live together so the format can
-only change in one place. Little-endian. Mirror in csrc/bnn_model.h."""
+only change in one place. Little-endian. Mirror in csrc/bnn_model.h (v1) and
+csrc/bnn_model_stem.h (v2, spectral stem).
+
+Two formats, auto-selected by whether the model has a spectral stem:
+  VERSION 1 - the original bireal models (no stem). Byte-for-byte UNCHANGED
+              from the original blob.py; the v1 write path below is the
+              original code verbatim, guarded by `if not _has_stem(...)`.
+  VERSION 2 - the spectral-stem A1b variant: a real-input binary-weight 1x1
+              stem + real fold prepended, and body enc1.conv1 flipped to BIN /
+              enc1.act1 flipped to integer. Consumed by csrc/bnn_model_stem.c
+              (bnn_infer_stem). The v1 engine (bnn_infer) rejects v2 and vice
+              versa, so the two never mix.
+"""
 
 import os
 import sys
@@ -23,6 +35,7 @@ import forward_driver as FD
 
 MAGIC = b"BNNC"
 VERSION = 1
+VERSION_STEM = 2
 UPSAMPLER = {"nearest": 0, "pixshuf": 1, "nnrefine": 2}
 
 TAG_CONV_BIN = 1
@@ -105,7 +118,53 @@ ENC = ["enc1", "enc2", "enc3", "enc4"]
 DEC = ["dec4", "dec3", "dec2", "dec1"]
 
 
+# ---------------------------------------------------------------------------
+# stem detection (decides v1 vs v2)
+# ---------------------------------------------------------------------------
+def _has_stem(named):
+    return ("stem.stem.0" in named) or ("body.enc1.conv1" in named)
+
+
+def _wrapped_prefix(named):
+    if "body.enc1.conv1" in named:
+        return "body."
+    return ""
+
+
+def _find_stem_modules(model):
+    """Locate the single stem conv and single stem ActBlock. Rejects
+    multi-layer / non-binarising stems (unsupported by the C forward)."""
+    convs, acts = [], []
+    for name, m in model.named_modules():
+        if name.split(".", 1)[0] != "stem":
+            continue
+        tn = type(m).__name__
+        if tn in ("HardBinaryConv", "RealConv", "Conv2d"):
+            w = getattr(m, "weight", None)
+            if w is not None and w.dim() == 4:
+                convs.append((name, m))
+        elif tn == "ActBlock":
+            acts.append((name, m))
+    if len(convs) != 1 or len(acts) != 1:
+        raise SystemExit(
+            f"blob: stem export supports only a single-layer binarising stem "
+            f"(found {len(convs)} conv(s), {len(acts)} act(s)); n_stem_layers>1 "
+            f"or a non-binarising stem is not supported by the C forward.")
+    return convs[0][0], convs[0][1], acts[0][0]
+
+
+# ---------------------------------------------------------------------------
+# writer
+# ---------------------------------------------------------------------------
 def write_blob(model, path, upsampler="nearest", n_bands=120, patch=32):
+    named = dict(model.named_modules())
+    if _has_stem(named):
+        return _write_blob_v2(model, path, named, upsampler, n_bands, patch)
+
+    # ======================================================================
+    # VERSION 1 path -- ORIGINAL CODE, UNCHANGED. Do not edit; the v1 blob
+    # must stay byte-for-byte identical to the pre-merge exporter.
+    # ======================================================================
     golden = FD.capture_golden(model, torch.randn(1, n_bands, patch, patch))
     # real-accumulator chains are structural, not measured: enc1.act1 always
     # (first conv sees raw float spectra). Under bilinear the four dec*.act1
@@ -141,14 +200,71 @@ def write_blob(model, path, upsampler="nearest", n_bands=120, patch=32):
     return path
 
 
-# ---- reader, for round-trip self-check in Python ----
+def _write_blob_v2(model, path, named, upsampler, n_bands, patch):
+    """VERSION 2 (spectral stem, A1b). Stem conv+act prepended; body enc1.conv1
+    flipped to BIN and enc1.act1 to integer via the structural real set."""
+    bp = _wrapped_prefix(named)
+    stem_conv_name, stem_conv, stem_act_name = _find_stem_modules(model)
+    if type(stem_conv).__name__ != "HardBinaryConv":
+        raise SystemExit(
+            f"blob: stem conv is {type(stem_conv).__name__}, expected "
+            f"HardBinaryConv (A1b: stem_weight='binary'). fp32-weight stems "
+            f"(A2/A2b) need a real-input real-weight C kernel not yet built.")
+
+    golden = FD.capture_golden(model, torch.randn(1, n_bands, patch, patch))
+    # ONLY the stem act is a real accumulator; enc1.act1 is now integer.
+    rules = FD.build_rules(model, golden, force_real={stem_act_name})
+
+    def rk(name):
+        k = bp + name
+        if k not in rules:
+            raise SystemExit(f"blob: rule key '{k}' not produced by build_rules "
+                             f"(sample keys: {sorted(list(rules))[:4]}...)")
+        return rules[k]
+
+    n_classes = named[bp + "outc"].weight.shape[0]
+    base_channels = named[bp + "enc1.conv1"].weight.shape[0]
+    with open(path, "wb") as f:
+        f.write(MAGIC)
+        f.write(struct.pack("<7i", VERSION_STEM, base_channels, n_bands,
+                            n_classes, UPSAMPLER[upsampler], 1, 1))
+        _w_conv_real(f, stem_conv)           # real-input binary-weight 1x1
+        _w_act(f, rules[stem_act_name])      # real fold
+        for i, st in enumerate(ENC):
+            _w_conv_bin(f, named[bp + f"{st}.conv1"])   # BIN even for enc1
+            _w_act(f, rk(f"{st}.act1"))
+            _w_conv_bin(f, named[bp + f"{st}.conv2"])
+            _w_act(f, rk(f"{st}.act2_skip"))
+            _w_act(f, rk(f"{st}.act2_down"))
+        _w_conv_bin(f, named[bp + "bottleneck.conv1"]); _w_act(f, rk("bottleneck.act1"))
+        _w_conv_bin(f, named[bp + "bottleneck.conv2"]); _w_act(f, rk("bottleneck.act2"))
+        for st in DEC:
+            _w_conv_bin(f, named[bp + f"{st}.conv1"]); _w_act(f, rk(f"{st}.act1"))
+            _w_conv_bin(f, named[bp + f"{st}.conv2"]); _w_act(f, rk(f"{st}.act2"))
+        _w_head(f, named[bp + "outc"])
+    return path
+
+
+# ---------------------------------------------------------------------------
+# reader (v1 + v2), for round-trip self-check in Python
+# ---------------------------------------------------------------------------
 def read_blob(path):
     with open(path, "rb") as f:
         assert f.read(4) == MAGIC, "bad magic"
-        version, base_channels, n_bands, n_classes, ups = struct.unpack("<5i", f.read(20))
+        version = struct.unpack("<i", f.read(4))[0]
+        if version == VERSION:
+            base_channels, n_bands, n_classes, ups = struct.unpack("<4i", f.read(16))
+            has_stem, n_stem_layers = 0, 0
+        elif version == VERSION_STEM:
+            (base_channels, n_bands, n_classes, ups,
+             has_stem, n_stem_layers) = struct.unpack("<6i", f.read(24))
+        else:
+            raise ValueError(f"unknown blob version {version}")
         out = {"version": version, "base_channels": base_channels,
                "n_bands": n_bands, "n_classes": n_classes, "upsampler": ups,
-               "convs": [], "acts": [], "head": None}
+               "has_stem": has_stem, "n_stem_layers": n_stem_layers,
+               "convs": [], "acts": [], "head": None,
+               "stem_conv": None, "stem_act": None}
 
         def rd_conv():
             tag = struct.unpack("<i", f.read(4))[0]
@@ -174,6 +290,10 @@ def read_blob(path):
             else:
                 a = [np.frombuffer(f.read(C * 4), np.float32).copy() for _ in range(4)]
                 return {"kind": "real", "C": C, "A": a[0], "B": a[1], "slope": a[2], "rsign": a[3]}
+
+        if version == VERSION_STEM:
+            out["stem_conv"] = rd_conv()
+            out["stem_act"] = rd_act()
 
         for i, st in enumerate(ENC):
             out["convs"].append(rd_conv()); out["acts"].append(rd_act())
