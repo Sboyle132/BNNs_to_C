@@ -23,6 +23,11 @@ void react_epilogue_int(const int32_t *P, const float *res, float *out,
 void react_epilogue_real(const float *cin, const float *res, float *out,
                          int C, int H, int W, const float *A, const float *B,
                          const float *move1, const float *prelu_w);
+/* NEON head + maxpool (bnn_react_opt.c); drop-in */
+void head_1x1_v2(const float *a, const float *W, const float *bias,
+                 float *logits, int Cin, int H, int W_, int Cout);
+void maxpool_real_v2(const float *x, float *out, int C, int H, int W, int k, int stride);
+void maxpool_P_v2(const int32_t *x, int32_t *out, int C, int H, int W, int k, int stride);
 /* NEON-vectorized epilogues (bnn_react_epi.c); ~4x on A53, drop-in for the above */
 void react_epilogue_int_v2(const int32_t *P, const float *res, float *out,
                            int C, int H, int W, const float *A, const float *B,
@@ -37,6 +42,12 @@ void react_proj_1x1(const float *x, const float *Wm, float *out,
 /* register-tiled binary conv (bnn_bconv_neon.c); 3x3/pad1/stride1 fast path */
 void bconv_blk_b4p4(const int8_t *a, const uint64_t *packed_w, int32_t *P,
                     int Cin, int H, int W, int Cout, int kh, int kw, int pad, int stride);
+void bconv_blk_b4p4_i16(const int8_t *a, const uint64_t *packed_w, int16_t *P,
+                    int Cin, int H, int W, int Cout, int kh, int kw, int pad, int stride);
+void react_epilogue_int_i16(const int16_t *P, const float *res, float *out,
+                            int C, int H, int W, const float *A, const float *B,
+                            const float *move1, const float *prelu_w);
+void maxpool_P_i16(const int16_t *x, int16_t *out, int C, int H, int W, int k, int stride);
 /* register-blocked real-input kernels (bnn_react_blk.c), need Cout % 8 == 0 */
 void react_proj_blk(const float *x, const float *Wm, float *out,
                     int Cin, int H, int W, int Cout);

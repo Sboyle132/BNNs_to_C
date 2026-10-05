@@ -7,6 +7,16 @@
 #include <arm_neon.h>
 #endif
 
+/* BNN_NO_FMA: use unfused mul+add in head so strict (-ffp-contract=off) x86 vs
+ * ARM golden gates are bit-exact. Default keeps the fused vfmaq (faster). */
+#ifdef __aarch64__
+#ifdef BNN_NO_FMA
+#define HEAD_MAC(acc, w, x) vaddq_f32((acc), vmulq_f32((w), (x)))
+#else
+#define HEAD_MAC(acc, w, x) vfmaq_f32((acc), (w), (x))
+#endif
+#endif
+
 /* ---- head: fp32 1x1 (Cout small, e.g. 16->3). Current head_1x1 strides the
  * input by H*W in the inner loop (cache-hostile); this streams contiguously
  * (out[o,:] += W[o,c]*a[c,:]) and vectorizes over pixels. ---- */
@@ -26,7 +36,7 @@ void head_1x1_v2(const float *a, const float *Wm, const float *bias,
             p = 0;
 #ifdef __aarch64__
             float32x4_t vw = vdupq_n_f32(w);
-            for (; p + 4 <= HW; p += 4) vst1q_f32(lo + p, vfmaq_f32(vld1q_f32(lo + p), vw, vld1q_f32(ac + p)));
+            for (; p + 4 <= HW; p += 4) vst1q_f32(lo + p, HEAD_MAC(vld1q_f32(lo + p), vw, vld1q_f32(ac + p)));
 #endif
             for (; p < HW; ++p) lo[p] += w * ac[p];
         }
@@ -57,6 +67,21 @@ void maxpool_real_v2(const float *x, float *out, int C, int H, int W, int k, int
         }
     }
 }
+/* int16 P pooling (scalar; negligible cost). Same floor dims as MaxPool2d. */
+void maxpool_P_i16(const int16_t *x, int16_t *out, int C, int H, int W, int k, int stride) {
+    if (k != 2 || stride != 2) return;
+    int Ho = (H - 2) / 2 + 1, Wo = (W - 2) / 2 + 1;
+    for (int c = 0; c < C; ++c) {
+        const int16_t *xc = x + (long)c * H * W; int16_t *oc = out + (long)c * Ho * Wo;
+        for (int oy = 0; oy < Ho; ++oy)
+            for (int ox = 0; ox < Wo; ++ox) {
+                const int16_t *r0 = xc + (long)(2*oy)*W + 2*ox, *r1 = xc + (long)(2*oy+1)*W + 2*ox;
+                int16_t m = r0[0]; if (r0[1] > m) m = r0[1]; if (r1[0] > m) m = r1[0]; if (r1[1] > m) m = r1[1];
+                oc[(long)oy*Wo + ox] = m;
+            }
+    }
+}
+
 void maxpool_P_v2(const int32_t *x, int32_t *out, int C, int H, int W, int k, int stride) {
     if (k != 2 || stride != 2) return;
     int Ho = (H - 2) / 2 + 1, Wo = (W - 2) / 2 + 1;

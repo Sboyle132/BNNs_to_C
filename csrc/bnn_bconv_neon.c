@@ -106,6 +106,27 @@ void bconv_col_scalar(const uint64_t *apack, const uint64_t *wpack, int Wc,
     }
 }
 
+void bconv_col_scalar_i16(const uint64_t *apack, const uint64_t *wpack, int Wc,
+                      int Cin, int kh, int kw, int H, int W, int Hout, int Wout,
+                      int oy, int oyb, int ky0, int ky1, int ox, int stride,
+                      int pad, int16_t *P, int c0, int c1) {
+    (void)H;
+    int oxb = ox * stride - pad;
+    int kx0 = oxb < 0 ? -oxb : 0, kx1 = (oxb + kw > W) ? W - oxb : kw;
+    int vt = (ky1 - ky0) * (kx1 - kx0) * Cin;
+    for (int co = c0; co < c1; ++co) {
+        const uint64_t *wco = wpack + (size_t)(co * kh) * kw * Wc;
+        uint32_t D = 0;
+        for (int ky = ky0; ky < ky1; ++ky) {
+            int iy = oyb + ky;
+            for (int kx = kx0; kx < kx1; ++kx)
+                D += xor_popcnt(apack + (size_t)(iy * W + oxb + kx) * Wc,
+                                wco + (size_t)(ky * kw + kx) * Wc, Wc);
+        }
+        P[((size_t)co * Hout + oy) * Wout + ox] = (int16_t)(vt - 2 * (int)D);
+    }
+}
+
 /* ===== candidate 1: channel-packed, deferred reduction, one co at a time ===== */
 void bconv_packed_neon(const int8_t *a, const uint64_t *packed_w, int32_t *P,
                        int Cin, int H, int W, int Cout, int kh, int kw,
@@ -164,4 +185,12 @@ void bconv_packed_neon(const int8_t *a, const uint64_t *packed_w, int32_t *P,
 #define CB 4
 #define PB 4
 #define SFX _b4p4
+#include "bnn_bconv_blk.h"
+
+/* int16-P variant of the engine's bconv (P fits int16: max |P|=Cin*9<=3456) */
+#define CB 4
+#define PB 4
+#define SFX _b4p4_i16
+#define BK_PT int16_t
+#define BK_PCOL bconv_col_scalar_i16
 #include "bnn_bconv_blk.h"

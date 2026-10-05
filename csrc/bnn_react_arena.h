@@ -15,5 +15,7 @@ void *rs_calloc(size_t n);   /* zeroed (bytes) */
 void  rs_free(void *p);
 void  rs_destroy(void);      /* release all blocks to the OS */
 size_t rs_footprint(void);   /* total bytes held by the pool */
-int    rs_nblocks(void);     /* number of blocks (== distinct concurrent sizes) */
+int    rs_nblocks(void);
+void   rs_dump(void);
+size_t rs_peak_used(void);
 #endif

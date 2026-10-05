@@ -19,9 +19,15 @@
 #define BK_CAT_(a, b) a##b
 #define BK_CAT(a, b) BK_CAT_(a, b)
 #endif
+#ifndef BK_PT
+#define BK_PT int32_t
+#endif
+#ifndef BK_PCOL
+#define BK_PCOL bconv_col_scalar
+#endif
 #define BK_NAME BK_CAT(bconv_blk, SFX)
 
-void BK_NAME(const int8_t *a, const uint64_t *packed_w, int32_t *P,
+void BK_NAME(const int8_t *a, const uint64_t *packed_w, BK_PT *P,
              int Cin, int H, int W, int Cout, int kh, int kw, int pad, int stride) {
     int Hout = od(H, kh, pad, stride), Wout = od(W, kw, pad, stride);
     int Wc = (Cin + 63) / 64;
@@ -35,7 +41,7 @@ void BK_NAME(const int8_t *a, const uint64_t *packed_w, int32_t *P,
         int ky0 = oyb < 0 ? -oyb : 0, ky1 = (oyb + kh > H) ? H - oyb : kh;
         if (general) {
             for (int ox = 0; ox < Wout; ++ox)
-                bconv_col_scalar(apack, wpack, Wc, Cin, kh, kw, H, W, Hout, Wout,
+                BK_PCOL(apack, wpack, Wc, Cin, kh, kw, H, W, Hout, Wout,
                                  oy, oyb, ky0, ky1, ox, stride, pad, P, 0, Cout);
             continue;
         }
@@ -45,7 +51,7 @@ void BK_NAME(const int8_t *a, const uint64_t *packed_w, int32_t *P,
             int ox = 0;
             while (ox < Wout) {
                 if (!(ox >= 1 && ox + PB <= Wout - 1)) {       /* edge column: scalar */
-                    bconv_col_scalar(apack, wpack, Wc, Cin, 3, 3, H, W, Hout, Wout,
+                    BK_PCOL(apack, wpack, Wc, Cin, 3, 3, H, W, Hout, Wout,
                                      oy, oyb, ky0, ky1, ox, 1, 1, P, co, co + CB);
                     ox += 1;
                     continue;
@@ -91,20 +97,22 @@ void BK_NAME(const int8_t *a, const uint64_t *packed_w, int32_t *P,
 #ifdef __aarch64__
                         D += vaddvq_u32(vpaddlq_u16(acc[c][j]));
 #endif
-                        P[((size_t)(co + c) * Hout + oy) * Wout + (ox + j)] = vt - 2 * (int)D;
+                        P[((size_t)(co + c) * Hout + oy) * Wout + (ox + j)] = (BK_PT)(vt - 2 * (int)D);
                     }
                 ox += PB;
             }
         }
         for (int co = coCB; co < Cout; ++co)                   /* channel tail */
             for (int ox = 0; ox < Wout; ++ox)
-                bconv_col_scalar(apack, wpack, Wc, Cin, 3, 3, H, W, Hout, Wout,
+                BK_PCOL(apack, wpack, Wc, Cin, 3, 3, H, W, Hout, Wout,
                                  oy, oyb, ky0, ky1, ox, 1, 1, P, co, co + 1);
     }
     rs_free(apack); rs_free(wpack);
 }
 
 #undef BK_NAME
+#undef BK_PT
+#undef BK_PCOL
 #undef CB
 #undef PB
 #undef SFX

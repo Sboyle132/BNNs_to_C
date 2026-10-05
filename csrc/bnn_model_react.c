@@ -8,7 +8,7 @@
  *           (enc1: c = conv_realin(x) ; h1 = epi1_real(c) + res, no tap)
  *   unit2:  a = tap2(h1) ; P2 = bconv(a)            (conv2 computed ONCE)
  *     down: skip = epi_skip(P2, h1)
- *           down = epi_down(maxpool_P_v2(P2), maxpool_real_v2(h1))
+ *           down = epi_down(maxpool_P_i16(P2), maxpool_real_v2(h1))
  *     plain: h2 = epi2(P2, h1)
  * Epilogues write in place over the shortcut buffer where legal (elementwise,
  * same index in/out), so no extra highway-sized allocation per unit. */
@@ -143,11 +143,11 @@ static void proj_dispatch(const ProjR *p, const float *x, float *out, int H, int
     else
         react_proj_1x1(x, p->W, out, p->Cin, H, W, p->Cout);
 }
-static void bconv_react(const ConvR *c, const int8_t *a, int32_t *P, int H, int W) {
+static void bconv_react(const ConvR *c, const int8_t *a, int16_t *P, int H, int W) {
+    /* every ReActNet binary conv is 3x3/pad1/stride1; no int16 fallback kernel needed */
     if (c->kh == 3 && c->kw == 3 && c->pad == 1 && c->stride == 1)
-        bconv_blk_b4p4(a, c->packed, P, c->Cin, H, W, c->Cout, 3, 3, 1, 1);
-    else
-        bconv_dispatch(a, c->packed, P, c->Cin, H, W, c->Cout, c->kh, c->kw, c->pad, c->stride);
+        bconv_blk_b4p4_i16(a, c->packed, P, c->Cin, H, W, c->Cout, 3, 3, 1, 1);
+    else { fprintf(stderr, "bconv_react: unexpected %dx%d conv\n", c->kh, c->kw); exit(1); }
 }
 static void conv_real_dispatch(const ConvR *c, const float *x, float *out, int H, int W) {
     if (c->kh == 3 && c->kw == 3 && c->pad == 1 && c->stride == 1 && c->Cout % 8 == 0)
@@ -178,9 +178,9 @@ static int8_t *tap_apply(const TapR *t, const float *x, int H, int W, const char
 }
 
 /* binary conv on a +-1 tap -> integer P */
-static int32_t *bconv_apply(const ConvR *c, const int8_t *a, int H, int W, const char *tag) {
+static int16_t *bconv_apply(const ConvR *c, const int8_t *a, int H, int W, const char *tag) {
     char lb[48]; (void)tag; (void)lb;
-    int32_t *P = rs_alloc((size_t)c->Cout * H * W * sizeof(int32_t));
+    int16_t *P = rs_alloc((size_t)c->Cout * H * W * sizeof(int16_t));
     PROF(PLABEL(lb, "%s.conv", tag), "bconv",
          (double)c->Cout * H * W, (double)c->Cin * c->kh * c->kw,
          bconv_react(c, a, P, H, W));
@@ -192,11 +192,11 @@ static float *unit1_bin(const BlockR *b, const float *x, int H, int W, const cha
     char lb[48]; (void)lb;
     float *res = proj_apply(&b->proj1, x, H, W, tag);
     int8_t *a1 = tap_apply(&b->tap1, x, H, W, tag);
-    int32_t *P1 = bconv_apply(&b->conv1, a1, H, W, tag);
+    int16_t *P1 = bconv_apply(&b->conv1, a1, H, W, tag);
     rs_free(a1);
     PROF(PLABEL(lb, "%s.epi", tag), "epi",
          (double)b->conv1.Cout * H * W, 0.0,
-         react_epilogue_int_v2(P1, res, res, b->conv1.Cout, H, W,
+         react_epilogue_int_i16(P1, res, res, b->conv1.Cout, H, W,
                             b->epi1.A, b->epi1.B, b->epi1.move1, b->epi1.prelu_w));
     rs_free(P1);
     return res;
@@ -206,11 +206,11 @@ static float *unit1_bin(const BlockR *b, const float *x, int H, int W, const cha
 static float *unit2_plain(const BlockR *b, float *h1, int H, int W, const char *tag) {
     char lb[48]; (void)lb;
     int8_t *a2 = tap_apply(&b->tap2, h1, H, W, tag);
-    int32_t *P2 = bconv_apply(&b->conv2, a2, H, W, tag);
+    int16_t *P2 = bconv_apply(&b->conv2, a2, H, W, tag);
     rs_free(a2);
     PROF(PLABEL(lb, "%s.epi", tag), "epi",
          (double)b->conv2.Cout * H * W, 0.0,
-         react_epilogue_int_v2(P2, h1, h1, b->conv2.Cout, H, W,
+         react_epilogue_int_i16(P2, h1, h1, b->conv2.Cout, H, W,
                             b->epi_a.A, b->epi_a.B, b->epi_a.move1, b->epi_a.prelu_w));
     rs_free(P2);
     return h1;
@@ -245,20 +245,20 @@ static void down_block(const BlockR *b, const float *x, int H, int W,
     char t2b[48];
     const char *t2 = PLABEL(t2b, "%s.u2", tag);   /* NULL w/o -DBNN_PROFILE; unused then */
     int8_t *a2 = tap_apply(&b->tap2, h1, H, W, t2);
-    int32_t *P2 = bconv_apply(&b->conv2, a2, H, W, t2);
+    int16_t *P2 = bconv_apply(&b->conv2, a2, H, W, t2);
     rs_free(a2);
 
     float *skip = rs_alloc((size_t)Co * H * W * sizeof(float));
     PROF(PLABEL(lb, "%s.skip", tag), "epi",
          (double)Co * H * W, 0.0,
-         react_epilogue_int_v2(P2, h1, skip, Co, H, W,
+         react_epilogue_int_i16(P2, h1, skip, Co, H, W,
                             b->epi_a.A, b->epi_a.B, b->epi_a.move1, b->epi_a.prelu_w));
 
     int Hh = H / 2, Wh = W / 2;
-    int32_t *Pd = rs_alloc((size_t)Co * Hh * Wh * sizeof(int32_t));
+    int16_t *Pd = rs_alloc((size_t)Co * Hh * Wh * sizeof(int16_t));
     PROF(PLABEL(lb, "%s.pool", tag), "maxpool",
          (double)Co * Hh * Wh, 4.0,
-         maxpool_P_v2(P2, Pd, Co, H, W, 2, 2));
+         maxpool_P_i16(P2, Pd, Co, H, W, 2, 2));
     rs_free(P2);
     float *h1d = rs_alloc((size_t)Co * Hh * Wh * sizeof(float));
     PROF(PLABEL(lb, "%s.poolr", tag), "maxpool",
@@ -267,7 +267,7 @@ static void down_block(const BlockR *b, const float *x, int H, int W,
     rs_free(h1);
     PROF(PLABEL(lb, "%s.down", tag), "epi",
          (double)Co * Hh * Wh, 0.0,
-         react_epilogue_int_v2(Pd, h1d, h1d, Co, Hh, Wh,
+         react_epilogue_int_i16(Pd, h1d, h1d, Co, Hh, Wh,
                             b->epi_b.A, b->epi_b.B, b->epi_b.move1, b->epi_b.prelu_w));
     rs_free(Pd);
     *skip_out = skip; *down_out = h1d;

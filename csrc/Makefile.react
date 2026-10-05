@@ -18,6 +18,7 @@ LDFLAGS ?= -fopenmp -lm
 
 KERNELS = bnn_conv.c bnn_conv_realin.c bnn_maxpool.c bnn_head.c bnn_prof.c bnn_react_ops.c bnn_react_epi.c bnn_react_opt.c bnn_react_blk.c bnn_bconv_neon.c bnn_react_arena.c
 REACT   = bnn_model_react.c main_react.c
+REACT_NOMAIN = bnn_model_react.c
 SRC     = $(KERNELS) $(REACT)
 HDR     = bnn_model_react.h bnn_realin_blk.h bnn_bconv_blk.h bnn_react_arena.h bnn_prof.h
 
@@ -67,6 +68,12 @@ bench_epi: $(EPI_BENCH_SRC)
 bench_epi_arm: $(EPI_BENCH_SRC)
 	$(ARM_CC) $(ARM_CFLAGS) -o $@ $(EPI_BENCH_SRC) -lm
 
+# engine memory report (pool held / true peak / steady state)
+mem_probe: mem_probe.c $(KERNELS) $(REACT_NOMAIN) $(HDR)
+	$(CC) $(CFLAGS) -o $@ mem_probe.c $(KERNELS) bnn_model_react.c $(LDFLAGS)
+mem_probe_arm: mem_probe.c $(KERNELS) $(REACT_NOMAIN) $(HDR)
+	$(ARM_CC) $(ARM_CFLAGS) -o $@ mem_probe.c $(KERNELS) bnn_model_react.c -lm
+
 bench_pack: bench_pack.c
 	$(CC) -O3 -march=native -Wall -Wextra -o $@ bench_pack.c -lm
 bench_pack_arm: bench_pack.c
@@ -79,6 +86,6 @@ bench_opt_arm: $(OPT_BENCH_SRC)
 	$(ARM_CC) $(ARM_CFLAGS) -o $@ $(OPT_BENCH_SRC) -lm
 
 clean:
-	rm -f bnn_infer_react bnn_infer_react_prof bnn_infer_react_arm bnn_infer_react_prof_arm libreact.so bench_real bench_real_arm bench_bconv bench_bconv_arm bench_epi bench_epi_arm bench_pack bench_pack_arm bench_opt bench_opt_arm
+	rm -f bnn_infer_react bnn_infer_react_prof bnn_infer_react_arm bnn_infer_react_prof_arm libreact.so mem_probe mem_probe_arm bench_real bench_real_arm bench_bconv bench_bconv_arm bench_epi bench_epi_arm bench_pack bench_pack_arm bench_opt bench_opt_arm
 
-.PHONY: clean profile arm arm_profile lib bench bench_arm bench_bconv bench_bconv_arm bench_epi bench_epi_arm bench_pack bench_pack_arm bench_opt bench_opt_arm bench_epi bench_epi_arm
+.PHONY: mem_probe mem_probe_arm clean profile arm arm_profile lib bench bench_arm bench_bconv bench_bconv_arm bench_epi bench_epi_arm bench_pack bench_pack_arm bench_opt bench_opt_arm bench_epi bench_epi_arm
