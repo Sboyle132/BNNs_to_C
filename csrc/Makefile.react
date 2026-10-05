@@ -1,0 +1,84 @@
+# Makefile.react - build the ReActNet (blob v3) engine, reusing the verified
+# kernel sources. PARALLEL to Makefile / Makefile.stem; their targets and
+# binaries are untouched.
+#   make -f Makefile.react             # desktop -> bnn_infer_react
+#   make -f Makefile.react profile     # -DBNN_PROFILE -> bnn_infer_react_prof
+#   make -f Makefile.react arm         # board build -> bnn_infer_react_arm
+#   make -f Makefile.react arm_profile # board build + per-op -> bnn_infer_react_prof_arm
+#   make -f Makefile.react lib         # libreact.so, ctypes kernels for python/verify/*react*.py
+#
+# Unlike Makefile.stem, -fopenmp is NOT hardcoded on any link line: LDFLAGS is
+# overridable, and the arm targets carry no openmp at all (Xilinx aarch64
+# sysroot has no libgomp; single-thread is what's wanted on the board anyway).
+# bnn_prof.c is linked into every target (main-side timing + prof_reset).
+
+CC      ?= gcc
+CFLAGS  ?= -O3 -march=native -fopenmp -Wall -Wextra
+LDFLAGS ?= -fopenmp -lm
+
+KERNELS = bnn_conv.c bnn_conv_realin.c bnn_maxpool.c bnn_head.c bnn_prof.c bnn_react_ops.c bnn_react_epi.c bnn_react_opt.c bnn_react_blk.c bnn_bconv_neon.c bnn_react_arena.c
+REACT   = bnn_model_react.c main_react.c
+SRC     = $(KERNELS) $(REACT)
+HDR     = bnn_model_react.h bnn_realin_blk.h bnn_bconv_blk.h bnn_react_arena.h bnn_prof.h
+
+bnn_infer_react: $(SRC) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+
+profile: CFLAGS += -DBNN_PROFILE
+profile: bnn_infer_react_prof
+bnn_infer_react_prof: $(SRC) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+
+# ZCU104 (cortex-a53). No openmp, static (dodges GLIBC skew vs the rootfs).
+ARM_CC     ?= aarch64-linux-gnu-gcc
+ARM_CFLAGS ?= -O3 -Wall -mcpu=cortex-a53 -static
+bnn_infer_react_arm: $(SRC) $(HDR)
+	$(ARM_CC) $(ARM_CFLAGS) -o $@ $(SRC) -lm
+arm: bnn_infer_react_arm
+bnn_infer_react_prof_arm: $(SRC) $(HDR)
+	$(ARM_CC) $(ARM_CFLAGS) -DBNN_PROFILE -o $@ $(SRC) -lm
+arm_profile: bnn_infer_react_prof_arm
+
+# shared lib of the kernels only (no model/prof), for the python verify harnesses
+libreact.so: bnn_conv.c bnn_conv_realin.c bnn_head.c bnn_react_ops.c
+	$(CC) $(CFLAGS) -fPIC -shared -o $@ $^ $(LDFLAGS)
+lib: libreact.so
+
+# Microbenchmark: current real-input kernels vs register-blocked candidates.
+#   make -f Makefile.react bench       -> bench_real      (x86: correctness + timing)
+#   make -f Makefile.react bench_arm   -> bench_real_arm  (static, copy to the board)
+BENCH_SRC = bench_real.c bnn_conv_realin.c bnn_react_ops.c bnn_react_arena.c
+bench_real: $(BENCH_SRC) bnn_realin_blk.h
+	$(CC) -O3 -march=native -Wall -Wextra -o $@ $(BENCH_SRC) -lm
+bench: bench_real
+bench_real_arm: $(BENCH_SRC) bnn_realin_blk.h
+	$(ARM_CC) $(ARM_CFLAGS) -o $@ $(BENCH_SRC) -lm
+bench_arm: bench_real_arm
+
+BCONV_BENCH_SRC = bench_bconv.c bnn_conv.c bnn_bconv_neon.c bnn_react_arena.c
+bench_bconv: $(BCONV_BENCH_SRC)
+	$(CC) -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas -o $@ $(BCONV_BENCH_SRC) -lm
+bench_bconv_arm: $(BCONV_BENCH_SRC)
+	$(ARM_CC) $(ARM_CFLAGS) -o $@ $(BCONV_BENCH_SRC) -lm
+
+EPI_BENCH_SRC = bench_epi.c bnn_react_ops.c bnn_react_epi.c
+bench_epi: $(EPI_BENCH_SRC)
+	$(CC) -O3 -march=native -Wall -Wextra -o $@ $(EPI_BENCH_SRC) -lm
+bench_epi_arm: $(EPI_BENCH_SRC)
+	$(ARM_CC) $(ARM_CFLAGS) -o $@ $(EPI_BENCH_SRC) -lm
+
+bench_pack: bench_pack.c
+	$(CC) -O3 -march=native -Wall -Wextra -o $@ bench_pack.c -lm
+bench_pack_arm: bench_pack.c
+	$(ARM_CC) $(ARM_CFLAGS) -o $@ bench_pack.c -lm
+
+OPT_BENCH_SRC = bench_opt.c bnn_react_opt.c bnn_head.c bnn_react_ops.c
+bench_opt: $(OPT_BENCH_SRC)
+	$(CC) -O3 -march=native -Wall -Wextra -o $@ $(OPT_BENCH_SRC) -lm
+bench_opt_arm: $(OPT_BENCH_SRC)
+	$(ARM_CC) $(ARM_CFLAGS) -o $@ $(OPT_BENCH_SRC) -lm
+
+clean:
+	rm -f bnn_infer_react bnn_infer_react_prof bnn_infer_react_arm bnn_infer_react_prof_arm libreact.so bench_real bench_real_arm bench_bconv bench_bconv_arm bench_epi bench_epi_arm bench_pack bench_pack_arm bench_opt bench_opt_arm
+
+.PHONY: clean profile arm arm_profile lib bench bench_arm bench_bconv bench_bconv_arm bench_epi bench_epi_arm bench_pack bench_pack_arm bench_opt bench_opt_arm bench_epi bench_epi_arm

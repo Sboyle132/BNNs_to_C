@@ -16,6 +16,12 @@ Backends:
   --backend c       the standalone C engine via ctypes (bnn2c/verify kernels)
   --verify          run both and assert the argmax maps match
 
+ReActNet (--react): the C backend is different. It exports the model to a v3
+blob (blob_react.py), runs the SHIPPED engine binary (csrc/bnn_infer_react,
+override with --react-engine) on the padded cube, and reads the logits back. So
+--verify --react checks the actual blob + C engine end to end against torch,
+not just the kernel chain.
+
 Outputs, per capture, under artifacts/<capture_name>/<model_name>/:
   labels.bin    H*W uint8, row-major (0=cloud,1=land,2=sea)
   labels.json   {"H":H,"W":W,"classes":["cloud","land","sea"]}  (sidecar)
@@ -147,6 +153,47 @@ def infer_c(model, cube, stem=False):
     return G["logits"][:, :H, :W]
 
 
+_REACT_BLOB = {}   # model id -> exported blob path (export once per run)
+
+
+def infer_c_react(model, cube, engine=None, n_bands=120, n_classes=3):
+    """ReActNet C backend: export model -> v3 blob (cached), run the standalone
+    engine binary on the padded cube, return logits cropped to [n_classes,H,W].
+    The engine binary is the shipped artifact, so this validates blob + engine
+    + export together against torch. Single-thread/openmp is whatever the
+    binary was built with (OMP_NUM_THREADS applies)."""
+    import subprocess
+    import tempfile
+    here = os.path.dirname(os.path.abspath(__file__))
+    bnn2c = os.path.abspath(os.path.join(here, "..", "bnn2c"))
+    if bnn2c not in sys.path:
+        sys.path.insert(0, bnn2c)
+    import blob_react as BR
+    engine = engine or os.path.abspath(
+        os.path.join(here, "..", "..", "csrc", "bnn_infer_react"))
+    if not os.path.exists(engine):
+        raise SystemExit(f"react engine not found: {engine}\n"
+                         f"  build it: make -f Makefile.react (in csrc/), "
+                         f"or pass --react-engine")
+    cp, H, W = pad_to_16(cube)
+    key = id(model)
+    if key not in _REACT_BLOB:
+        d = tempfile.mkdtemp(prefix="react_blob_")
+        _REACT_BLOB[key] = os.path.join(d, "weights_react.blob")
+        BR.write_blob_react(model, _REACT_BLOB[key], n_bands=n_bands,
+                            n_classes=n_classes)
+    Hp, Wp = cp.shape[1], cp.shape[2]
+    with tempfile.TemporaryDirectory(prefix="react_run_") as td:
+        fin, fout = os.path.join(td, "in.bin"), os.path.join(td, "out.bin")
+        np.ascontiguousarray(cp, np.float32).tofile(fin)
+        r = subprocess.run([engine, _REACT_BLOB[key], fin, fout, str(Hp), str(Wp), "1"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"react engine failed (rc={r.returncode}): {r.stderr.strip()}")
+        logits = np.fromfile(fout, np.float32).reshape(n_classes, Hp, Wp)
+    return logits[:, :H, :W]
+
+
 # ---------------------------------------------------------------------------
 # outputs
 # ---------------------------------------------------------------------------
@@ -195,6 +242,11 @@ def main():
                     help="'a1b' builds the spectral-stem model and runs the "
                          "stem C forward (run_chain_stem)")
     ap.add_argument("--stem-channels", type=int, default=16)
+    ap.add_argument("--react", action="store_true",
+                    help="build the ReActNet model; the C backend runs the "
+                         "standalone v3 engine (see --react-engine)")
+    ap.add_argument("--react-engine", default=None,
+                    help="path to bnn_infer_react (default: <repo>/csrc/bnn_infer_react)")
     ap.add_argument("--project-dir", default=os.environ.get("HYPSO_REPO", "."))
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--split", choices=["test", "val", "train"])
@@ -216,8 +268,11 @@ def main():
     import yaml
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+    if args.react and args.stem != "none":
+        raise SystemExit("--react and --stem are mutually exclusive")
     model_name = (args.model_name or args.model_class
-                  or ("stem_a1b" if args.stem != "none" else "model"))
+                  or ("stem_a1b" if args.stem != "none"
+                      else "reactnet" if args.react else "model"))
 
     # build model
     import torch
@@ -232,10 +287,19 @@ def main():
         if isinstance(_sd, dict) and "state_dict" in _sd:
             _sd = _sd["state_dict"]
         model.load_state_dict(_sd, strict=True)
+    elif args.react:
+        from models.bnn_unet_cpba_a2_dualskip_bireal_reactnet import (
+            BNN_UNet_CPBA_A2_DualSkip_BiReal_ReActNet as _ReAct)
+        model = _ReAct(n_bands=args.n_bands, n_classes=args.n_classes,
+                       base_channels=16)
+        _sd = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        if isinstance(_sd, dict) and "state_dict" in _sd:
+            _sd = _sd["state_dict"]
+        model.load_state_dict(_sd, strict=True)
     else:
         if not (args.model_module and args.model_class):
             raise SystemExit("--model-module and --model-class are required "
-                             "unless --stem a1b is given")
+                             "unless --stem a1b or --react is given")
         from dump_model_spec import load_real_model
         from types import SimpleNamespace
         ns = SimpleNamespace(model_module=args.model_module, model_class=args.model_class,
@@ -272,7 +336,9 @@ def main():
         cube, gt = load_capture_cube(cfg, args.project_dir, index, normaliser,
                                      band_indices, cid)
         if args.verify:
-            lt = infer_torch(model, cube); lc = infer_c(model, cube, stem=(args.stem != "none"))
+            lt = infer_torch(model, cube)
+            lc = (infer_c_react(model, cube, args.react_engine, args.n_bands, args.n_classes)
+                  if args.react else infer_c(model, cube, stem=(args.stem != "none")))
             st, sc = lt.argmax(0), lc.argmax(0)
             agree = float((st == sc).mean())
             ndis = int((st != sc).sum())
@@ -296,8 +362,11 @@ def main():
             tag = (f"verify OK (argmax {agree*100:.3f}%, {ndis} float-boundary "
                    f"px within tol)")
         else:
-            logits = (infer_c(model, cube, stem=(args.stem != "none"))
-                      if args.backend == "c" else infer_torch(model, cube))
+            if args.backend == "c":
+                logits = (infer_c_react(model, cube, args.react_engine, args.n_bands, args.n_classes)
+                          if args.react else infer_c(model, cube, stem=(args.stem != "none")))
+            else:
+                logits = infer_torch(model, cube)
             seg = logits.argmax(0)
             tag = f"backend={args.backend}"
         out_dir = os.path.join(args.out_root, cid, model_name)

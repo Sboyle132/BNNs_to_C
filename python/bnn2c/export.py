@@ -1,8 +1,9 @@
 """export.py - export a trained BNN checkpoint to weights.blob for the C engine.
 
-Handles BOTH:
+Handles THREE:
   * the original bireal models (no stem)          -> v1 blob -> bnn_infer
   * the spectral-stem A1b variant (--stem a1b)    -> v2 blob -> bnn_infer_stem
+  * the ReActNet real-highway variant (--react)   -> v3 blob -> bnn_infer_react
 
 blob.write_blob auto-selects v1/v2 from the model (presence of a stem), so the
 only thing --stem changes here is HOW THE MODEL IS BUILT: the stem wrapper
@@ -20,6 +21,11 @@ A1b model is constructed directly. The v1 path is unchanged.
   python3 export.py --stem a1b \
       --checkpoint runs/bnn_unet_cpba_a2_dualskip_fp32_wbin_abin_stem/best_model.pt \
       --stem-channels 16 --out artifacts/weights_stem.blob
+
+  # v3 (ReActNet real highway):
+  python3 export.py --react \
+      --checkpoint runs/bnn_unet_cpba_a2_dualskip_bireal_reactnet/best_model.pt \
+      --out artifacts/weights_react.blob
 """
 
 import argparse
@@ -82,6 +88,17 @@ def _build_stem_a1b(args):
     return model
 
 
+def _build_react(args):
+    """Construct the ReActNet model directly (same constructor args as B0), so
+    this path never depends on dump_model_spec.load_real_model."""
+    from models.bnn_unet_cpba_a2_dualskip_bireal_reactnet import (
+        BNN_UNet_CPBA_A2_DualSkip_BiReal_ReActNet as ReAct)
+    model = ReAct(n_bands=args.n_bands, n_classes=args.n_classes,
+                  base_channels=args.base_channels)
+    _load_checkpoint_direct(model, args.checkpoint)
+    return model
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-module")
@@ -101,11 +118,20 @@ def main():
                     help="'a1b' builds the binary-weight binarised-output "
                          "spectral-stem model (writes a v2 blob)")
     ap.add_argument("--stem-channels", type=int, default=16)
+    # ReActNet real-highway variant
+    ap.add_argument("--react", action="store_true",
+                    help="build the ReActNet model and write a v3 blob "
+                         "(consumed by csrc/bnn_model_react.c, bnn_infer_react)")
     args = ap.parse_args()
 
     import torch
 
-    if args.stem == "a1b":
+    if args.react and args.stem != "none":
+        raise SystemExit("--react and --stem are mutually exclusive")
+
+    if args.react:
+        model = _build_react(args)
+    elif args.stem == "a1b":
         model = _build_stem_a1b(args)
     else:
         from dump_model_spec import load_real_model
@@ -127,6 +153,26 @@ def main():
               f"represent 0)")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+
+    if args.react:
+        # v3: separate writer/reader (blob_react.py), v1/v2 write paths untouched.
+        import blob_react as BR
+        BR.write_blob_react(model, args.out, base_channels=args.base_channels,
+                            n_bands=args.n_bands, n_classes=args.n_classes,
+                            upsampler=args.upsampler)
+        b = BR.read_blob_react(args.out)       # round-trip (asserts layout, no trailing bytes)
+        assert b["version"] == 3 and b["n_bands"] == args.n_bands
+        assert b["n_classes"] == args.n_classes
+        assert len(b["blocks"]) == 9 and b["blocks"]["enc1"]["conv1"]["tag"] == "real"
+        assert "tap1" not in b["blocks"]["enc1"], "enc1 has no tap1 (raw spectra in)"
+        size = os.path.getsize(args.out)
+        print(f"wrote {args.out}  ({size:,} bytes)  [v3 ReActNet]")
+        print(f"  base_channels={b['base_channels']} n_bands={b['n_bands']} "
+              f"n_classes={b['n_classes']} upsampler={args.upsampler}")
+        print(f"  9 blocks (4 down + bottleneck + 4 dec), 18 convs, 9 projs, "
+              f"22 epilogues, 17 taps, round-trip OK")
+        return
+
     BLOB.write_blob(model, args.out, upsampler=args.upsampler,
                     n_bands=args.n_bands, patch=args.patch)
 
