@@ -194,3 +194,38 @@ void bconv_packed_neon(const int8_t *a, const uint64_t *packed_w, int32_t *P,
 #define BK_PT int16_t
 #define BK_PCOL bconv_col_scalar_i16
 #include "bnn_bconv_blk.h"
+
+/* vector reduce+store variants (b4p4 only): 4 pixels reduced per instruction
+ * group, one vector store per channel instead of 4 scalar reductions+stores. */
+#define CB 4
+#define PB 4
+#define SFX _b4p4v
+#define BK_VRED 1
+#define BK_VST4(p, v) vst1q_s32((p), (v))
+#include "bnn_bconv_blk.h"
+#define CB 4
+#define PB 4
+#define SFX _b4p4v_i16
+#define BK_PT int16_t
+#define BK_PCOL bconv_col_scalar_i16
+#define BK_VRED 1
+#define BK_VST4(p, v) vst1_s16((p), vmovn_s32(v))
+#include "bnn_bconv_blk.h"
+
+/* Wc==1 pixel-pair NEON popcount + vector reduce/store (b4p4 only) */
+#define CB 4
+#define PB 4
+#define SFX _b4p4w
+#define BK_VRED 1
+#define BK_WC1V 1
+#define BK_VST4(p, v) vst1q_s32((p), (v))
+#include "bnn_bconv_blk.h"
+#define CB 4
+#define PB 4
+#define SFX _b4p4w_i16
+#define BK_PT int16_t
+#define BK_PCOL bconv_col_scalar_i16
+#define BK_VRED 1
+#define BK_WC1V 1
+#define BK_VST4(p, v) vst1_s16((p), vmovn_s32(v))
+#include "bnn_bconv_blk.h"

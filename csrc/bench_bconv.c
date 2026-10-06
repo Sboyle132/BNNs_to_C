@@ -25,25 +25,31 @@ void pack_weights(const int8_t *, uint64_t *, int, int, int, int);
 void bconv_xnor(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
 void bconv_xnor_packed(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
 /* candidates (bnn_bconv_neon.c) */
-void bconv_packed_neon(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
-void bconv_blk_b4(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
-void bconv_blk_b8(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
-void bconv_blk_b16(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
-void bconv_blk_b4p2(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
-void bconv_blk_b8p2(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
 void bconv_blk_b4p4(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
+void bconv_blk_b4p4_i16(const int8_t *, const uint64_t *, int16_t *, int, int, int, int, int, int, int, int);
+void bconv_blk_b4p4v(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
+void bconv_blk_b4p4v_i16(const int8_t *, const uint64_t *, int16_t *, int, int, int, int, int, int, int, int);
+void bconv_blk_b4p4w(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
+void bconv_blk_b4p4w_i16(const int8_t *, const uint64_t *, int16_t *, int, int, int, int, int, int, int, int);
 
 typedef void (*bk)(const int8_t *, const uint64_t *, int32_t *, int, int, int, int, int, int, int, int);
-typedef struct { const char *name; bk fn; int max_cin; } Kern;   /* max_cin: skip above (dense gather explodes) */
+typedef void (*bk16)(const int8_t *, const uint64_t *, int16_t *, int, int, int, int, int, int, int, int);
+typedef struct { const char *name; bk fn; bk16 fn16; int max_cin; } Kern;
 static const Kern K[] = {
-    {"packed",  bconv_xnor_packed, 100000},   /* current (Cin>=36) */
-    {"b4",      bconv_blk_b4,      100000},   /* last round's winner */
-    {"b8",      bconv_blk_b8,      100000},
-    {"b16",     bconv_blk_b16,     100000},
-    {"b4p2",    bconv_blk_b4p2,    100000},
-    {"b8p2",    bconv_blk_b8p2,    100000},
-    {"b4p4",    bconv_blk_b4p4,    100000},
+    {"packed",    bconv_xnor_packed, 0, 100000},   /* original (pre-tiling) baseline */
+    {"b4p4",      bconv_blk_b4p4,      0, 100000}, /* int32 P, scalar reduce+store */
+    {"b4p4_i16",  0, bconv_blk_b4p4_i16,   100000}, /* int16 P, scalar (engine now) */
+    {"b4p4v",     bconv_blk_b4p4v,     0, 100000}, /* int32 P, vector reduce+store */
+    {"b4p4v_i16", 0, bconv_blk_b4p4v_i16,  100000}, /* int16 P, vector (candidate) */
+    {"b4p4w",     bconv_blk_b4p4w,     0, 100000}, /* + Wc==1 NEON pixel-pair popcount, int32 */
+    {"b4p4w_i16", 0, bconv_blk_b4p4w_i16,  100000}, /* + Wc==1 NEON pixel-pair popcount, int16 */
 };
+/* run any kernel; int16 kernels write into the int32 buffer reinterpreted */
+static void run_k(const Kern *k, const int8_t *a, const uint64_t *pw, int32_t *P,
+                  int Cin, int H, int W, int Cout) {
+    if (k->fn16) k->fn16(a, pw, (int16_t *)P, Cin, H, W, Cout, 3, 3, 1, 1);
+    else         k->fn(a, pw, P, Cin, H, W, Cout, 3, 3, 1, 1);
+}
 #define NK (int)(sizeof K / sizeof K[0])
 
 /* the 17 binary convs: {Cin,H,W,Cout}, k=3 pad=1 stride=1 */
@@ -84,7 +90,8 @@ static int check_shape(int Cin, int H, int W, int Cout, const char *tag) {
     for (int k = 0; k < NK; ++k) {
         if (Cin > K[k].max_cin) { printf("  %-8s -", K[k].name); continue; }
         memset(got, 0x5A, no*4);
-        K[k].fn(a, pw, got, Cin, H, W, Cout, 3, 3, 1, 1);
+        run_k(&K[k], a, pw, got, Cin, H, W, Cout);
+        if (K[k].fn16) for (size_t i = no; i-- > 0; ) got[i] = ((int16_t *)got)[i];
         int mism = memcmp(got, ref, no*4) ? 1 : 0;
         if (mism) { size_t c = 0; for (size_t i = 0; i < no; ++i) c += got[i] != ref[i]; printf("  %s:%zuMISM", K[k].name, c); bad++; }
         else printf("  %-8s ok", K[k].name);
@@ -98,7 +105,7 @@ static int check_all(void) {
     printf("== correctness vs bconv_naive_int (EXACT; any mismatch = bug) ==\n");
     /* edge shapes: tiny, odd, 1-row, 1-col, Cout not mult of 4, Cin tail bits */
     const int e[][4] = {{1,1,1,4},{3,1,5,4},{5,5,1,8},{7,4,4,6},{16,3,3,16},
-                        {17,5,7,8},{63,4,6,8},{64,4,6,8},{65,4,6,8},{130,3,3,8},{48,9,9,16}};
+                        {17,5,7,8},{130,3,10,8},{192,3,12,8},{63,4,6,8},{64,4,6,8},{65,4,6,8},{130,3,3,8},{48,9,9,16}};
     for (size_t i = 0; i < sizeof e/sizeof e[0]; ++i) bad += check_shape(e[i][0],e[i][1],e[i][2],e[i][3],"edge");
     /* a few real shapes shrunk in H,W (full res is slow; logic is size-independent) */
     for (int s = 0; s < NSH; ++s) {
@@ -129,7 +136,7 @@ static void time_all(void) {
         for (int k = 0; k < NK; ++k) {
             if (Cin > K[k].max_cin) { ms[k] = -1; printf(" %8s", "-"); continue; }
             double best = 1e30;
-            for (int r = 0; r < REPS; ++r) { double t = now_ms(); K[k].fn(a, pw, P, Cin, H, W, Cout, 3, 3, 1, 1); t = now_ms()-t; if (t < best) best = t; }
+            for (int r = 0; r < REPS; ++r) { double t = now_ms(); run_k(&K[k], a, pw, P, Cin, H, W, Cout); t = now_ms()-t; if (t < best) best = t; }
             ms[k] = best; tot[k] += best; printf(" %8.1f", best);
             if (best < bms) { bms = best; bi = k; }
         }
@@ -141,7 +148,7 @@ static void time_all(void) {
     printf("%-8s %-9s %4s %9s", "TOTAL", "", "", "");
     for (int k = 0; k < NK; ++k) { if (tot[k] > 0) printf(" %8.1f", tot[k]); else printf(" %8s", "-"); }
     printf("\n");
-    printf("current dispatch   (dense if Cin<36 else packed) : %8.1f ms\n", tot_cur);
+    printf("packed baseline (pre-tiling) : %8.1f ms\n", tot_cur);
     printf("best-per-shape mix (lower bound if we dispatch to the winner): %8.1f ms\n", bestmix);
 }
 

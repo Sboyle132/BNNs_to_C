@@ -297,15 +297,110 @@ static float *up_cat_f(const float *skip, int sC, int sH, int sW,
     return out;
 }
 
-void bnn_forward_react(const ModelR *m, const float *input, int H, int W, float *logits) {
+/* ---- streaming input for enc1 (don't hold the full cube) ---------------------
+ * enc1 is the only consumer of the raw input and is local (two 3x3 convs + a
+ * 2x2 pool, RF radius 2). So it is driven in row-strips with a small halo; each
+ * strip's valid output rows are bit-exact (overlap-save). The input rows for a
+ * strip come from a reader callback, so the caller decides whether the cube is
+ * streamed from a file (never fully resident) or indexed from memory. */
+typedef void (*bnn_in_reader)(void *ctx, int r0, int r1, int W, int nb, float *dst);
+
+typedef struct { const float *data; int H; } mem_ctx;
+static void mem_reader(void *vc, int r0, int r1, int W, int nb, float *dst) {
+    const mem_ctx *c = vc;
+    for (int b = 0; b < nb; ++b)
+        memcpy(dst + (size_t)b * (r1 - r0) * W,
+               c->data + ((size_t)b * c->H + r0) * W, (size_t)(r1 - r0) * W * sizeof(float));
+}
+
+#define ENC1_STRIP 64          /* default output rows per strip (even); board: speed flat vs S, S=64 packs the pool best (lowest RSS) */
+/* runtime override for tuning: BNN_ENC1_STRIP=<even rows>. Any even value >= 8
+ * gives bit-identical output; it only trades halo recompute vs buffer size. */
+static int enc1_strip_rows(void) {
+    const char *e = getenv("BNN_ENC1_STRIP");
+    int v = e ? atoi(e) : ENC1_STRIP;
+    if (v < 8) v = ENC1_STRIP;
+    return v & ~1;
+}
+#define ENC1_HALO  2           /* enc1 = two stacked 3x3 convs -> RF radius 2; even for pool alignment */
+
+/* produce full skip[0] (H x W) and down (H/2 x W/2) by strip-processing enc1 */
+static void enc1_strided(const ModelR *m, bnn_in_reader rd, void *ctx, int H, int W,
+                         float **skip0, float **down0, int *downC) {
+    const BlockR *b = &m->enc[0];
+    int Co = b->conv2.Cout, Hh = H / 2, Wh = W / 2, nb = m->n_bands;
+    float *skip = rs_alloc((size_t)Co * H * W * sizeof(float));
+    float *down = rs_alloc((size_t)Co * Hh * Wh * sizeof(float));
+    const int S = enc1_strip_rows();
+    for (int y0 = 0; y0 < H; y0 += S) {
+        int y1 = y0 + S < H ? y0 + S : H;                            /* even */
+        int r0 = y0 - ENC1_HALO > 0 ? y0 - ENC1_HALO : 0;            /* even */
+        int r1 = y1 + ENC1_HALO < H ? y1 + ENC1_HALO : H;            /* even */
+        int sh = r1 - r0;
+        float *in_s = rs_alloc((size_t)nb * sh * W * sizeof(float));
+        rd(ctx, r0, r1, W, nb, in_s);
+        float *sk_s, *dn_s;
+        down_block(b, in_s, sh, W, &sk_s, &dn_s, "enc1");            /* reuses the block kernel */
+        rs_free(in_s);
+        for (int c = 0; c < Co; ++c)                                 /* valid skip rows [y0,y1) */
+            memcpy(skip + ((size_t)c * H + y0) * W,
+                   sk_s + ((size_t)c * sh + (y0 - r0)) * W, (size_t)(y1 - y0) * W * sizeof(float));
+        int dy0 = y0 / 2, dy1 = y1 / 2, dsrc = (y0 - r0) / 2, dsh = sh / 2;
+        for (int c = 0; c < Co; ++c)                                 /* valid down rows [y0/2,y1/2) */
+            memcpy(down + ((size_t)c * Hh + dy0) * Wh,
+                   dn_s + ((size_t)c * dsh + dsrc) * Wh, (size_t)(dy1 - dy0) * Wh * sizeof(float));
+        rs_free(sk_s); rs_free(dn_s);
+    }
+    *skip0 = skip; *down0 = down; *downC = Co;
+}
+
+/* dec1 + head, strip-processed (mirror of enc1): dec1 is full-res and local
+ * (two 3x3 convs, RF radius 2), so its 48-channel concat is built per-strip
+ * instead of whole. skip0 (16ch @ HxW) and xd (dec2 output, held) are indexed;
+ * everything dec1-local is per-strip. Valid rows are bit-exact (overlap-save,
+ * halo 2). head (1x1) is fused in so logits are written directly. */
+static void dec1_strided(const ModelR *m, float *skip0, int sC,
+                         float *xd, int xC, int xH, int xW,
+                         int H, int W, float *logits) {
+    const BlockR *b = &m->dec[3];
+    int Wh = W / 2, S = enc1_strip_rows(); (void)xW;
+    for (int y0 = 0; y0 < H; y0 += S) {
+        int y1 = y0 + S < H ? y0 + S : H;                 /* even */
+        int r0 = y0 - ENC1_HALO > 0 ? y0 - ENC1_HALO : 0; /* even */
+        int r1 = y1 + ENC1_HALO < H ? y1 + ENC1_HALO : H; /* even */
+        int sh = r1 - r0;
+        float *sk_s = rs_alloc((size_t)sC * sh * W * sizeof(float));
+        for (int c = 0; c < sC; ++c)
+            memcpy(sk_s + (size_t)c * sh * W, skip0 + ((size_t)c * H + r0) * W, (size_t)sh * W * sizeof(float));
+        int xr0 = r0 / 2, xrh = sh / 2;                   /* nearest-up: cat row r <- xd row r/2 */
+        float *xd_s = rs_alloc((size_t)xC * xrh * Wh * sizeof(float));
+        for (int c = 0; c < xC; ++c)
+            memcpy(xd_s + (size_t)c * xrh * Wh, xd + ((size_t)c * xH + xr0) * Wh, (size_t)xrh * Wh * sizeof(float));
+        int catC;
+        float *cat = up_cat_f(sk_s, sC, sh, W, xd_s, xC, xrh, Wh, &catC);
+        rs_free(sk_s); rs_free(xd_s);
+        float *h1 = unit1_bin(b, cat, sh, W, "dec1"); rs_free(cat);
+        float *h2 = unit2_plain(b, h1, sh, W, "dec1");
+        float *lg = rs_alloc((size_t)m->head_Cout * sh * W * sizeof(float));
+        head_1x1_v2(h2, m->head_W, m->head_bias, lg, m->head_Cin, sh, W, m->head_Cout);
+        rs_free(h2);
+        int vr0 = y0 - r0;
+        for (int c = 0; c < m->head_Cout; ++c)
+            memcpy(logits + ((size_t)c * H + y0) * W, lg + ((size_t)c * sh + vr0) * W, (size_t)(y1 - y0) * W * sizeof(float));
+        rs_free(lg);
+    }
+}
+
+/* core forward, enc1 fed by a reader. */
+static void forward_core(const ModelR *m, bnn_in_reader rd, void *ctx, int H, int W, float *logits) {
     prof_reset();
     float *skip[4]; int skipC[4], skipH[4], skipW[4];
     char lbl[24];
 
-    /* ---- encoder ---- */
+    /* ---- encoder: enc1 strip-streamed, enc2..4 as before ---- */
     float *x; int xC, xH, xW;
-    down_block(&m->enc[0], input, H, W, &skip[0], &x, "enc1");
-    skipC[0] = m->enc[0].conv2.Cout; skipH[0] = H; skipW[0] = W;
+    enc1_strided(m, rd, ctx, H, W, &skip[0], &x, &skipC[0]);
+    skipH[0] = H; skipW[0] = W;
     xC = skipC[0]; xH = H / 2; xW = W / 2;
     for (int i = 1; i < 4; ++i) {
         float *nx;
@@ -314,14 +409,14 @@ void bnn_forward_react(const ModelR *m, const float *input, int H, int W, float 
         skipC[i] = m->enc[i].conv2.Cout; skipH[i] = xH; skipW[i] = xW;
         xC = skipC[i]; xH /= 2; xW /= 2;
     }
-    /* ---- bottleneck ---- */
+    /* ---- bottleneck (fc) ---- */
     {
         float *h1 = unit1_bin(&m->bott, x, xH, xW, "bott.u1"); rs_free(x);
         x = unit2_plain(&m->bott, h1, xH, xW, "bott.u2");
         xC = m->bott.conv2.Cout;
     }
-    /* ---- decoder dec4..dec1 ---- */
-    for (int i = 0; i < 4; ++i) {
+    /* ---- decoder dec4..dec2 (full); dec1 + head strip-streamed ---- */
+    for (int i = 0; i < 3; ++i) {
         int si = 3 - i;
         int H2 = skipH[si], W2 = skipW[si];
         int catC;
@@ -337,11 +432,102 @@ void bnn_forward_react(const ModelR *m, const float *input, int H, int W, float 
         x = unit2_plain(&m->dec[i], h1, H2, W2, t2);
         xC = m->dec[i].conv2.Cout; xH = H2; xW = W2;
     }
-    /* ---- head: x is already real, no widen ---- */
-    PROF("head", "head",
-         (double)m->head_Cout * xH * xW, (double)m->head_Cin,
-         head_1x1_v2(x, m->head_W, m->head_bias, logits, m->head_Cin, xH, xW, m->head_Cout));
-    rs_free(x);
+    /* dec1 (si=0, full res) + head, strip-streamed */
+    dec1_strided(m, skip[0], skipC[0], x, xC, xH, xW, H, W, logits);
+    rs_free(x); rs_free(skip[0]);
+}
+
+/* in-memory API (unchanged signature): enc1 still strip-processed, but the cube
+ * is indexed from the caller's buffer, so this does not reduce input residency.
+ * Bit-identical to the pre-streaming engine. */
+void bnn_forward_react(const ModelR *m, const float *input, int H, int W, float *logits) {
+    mem_ctx c = { input, H };
+    forward_core(m, mem_reader, &c, H, W, logits);
+}
+
+/* patch-wise forward: run the full network independently on each PxP patch
+ * (zero-padded at image borders by the convs), exactly as a standalone PxP
+ * image, and stitch. This reproduces 32x32 patch inference (how the model was
+ * trained), NOT whole-capture inference; the two differ at patch seams because
+ * the receptive field (92) exceeds the patch. Memory = one patch working set,
+ * reused across patches. P must be a multiple of 16 (four 2x2 pools). */
+void bnn_forward_react_patched(const ModelR *m, const float *input, int H, int W,
+                               float *logits, int P) {
+    int nb = m->n_bands, ncl = m->n_classes;
+    float *pin = rs_alloc((size_t)nb * P * P * sizeof(float));
+    float *pout = rs_alloc((size_t)ncl * P * P * sizeof(float));
+    for (int py = 0; py < H; py += P) {
+        int ph = py + P < H ? P : H - py;
+        for (int px = 0; px < W; px += P) {
+            int pw = px + P < W ? P : W - px;
+            if (ph < P || pw < P) memset(pin, 0, (size_t)nb * P * P * sizeof(float));
+            for (int b = 0; b < nb; ++b)
+                for (int y = 0; y < ph; ++y)
+                    memcpy(pin + ((size_t)b * P + y) * P,
+                           input + ((size_t)b * H + py + y) * W + px, (size_t)pw * sizeof(float));
+            bnn_forward_react(m, pin, P, P, pout);        /* full net on one PxP patch */
+            for (int c = 0; c < ncl; ++c)
+                for (int y = 0; y < ph; ++y)
+                    memcpy(logits + ((size_t)c * H + py + y) * W + px,
+                           pout + ((size_t)c * P + y) * P, (size_t)pw * sizeof(float));
+        }
+    }
+    rs_free(pin); rs_free(pout);
+}
+
+/* patch-wise forward reading the cube from a file ([n_bands,H,W] f32). One
+ * patch-ROW at a time: for each band the P rows of the current patch row are
+ * read contiguously (P*W floats), then sliced into PxP patches. Resident input
+ * = nb*P*W floats (17 MB at 120x32x1092), not the whole cube. */
+void bnn_forward_react_patched_file(const ModelR *m, FILE *f, int H, int W,
+                                    float *logits, int P) {
+    int nb = m->n_bands, ncl = m->n_classes;
+    float *rowbuf = rs_alloc((size_t)nb * P * W * sizeof(float));
+    float *pin = rs_alloc((size_t)nb * P * P * sizeof(float));
+    float *pout = rs_alloc((size_t)ncl * P * P * sizeof(float));
+    for (int py = 0; py < H; py += P) {
+        int ph = py + P < H ? P : H - py;
+        for (int b = 0; b < nb; ++b) {
+            long off = ((long)b * H + py) * W * (long)sizeof(float);
+            if (fseek(f, off, SEEK_SET) != 0 ||
+                fread(rowbuf + (size_t)b * P * W, sizeof(float), (size_t)ph * W, f) != (size_t)ph * W) {
+                fprintf(stderr, "patched_file: short read band %d rows %d..%d\n", b, py, py + ph); exit(1);
+            }
+        }
+        for (int px = 0; px < W; px += P) {
+            int pw = px + P < W ? P : W - px;
+            if (ph < P || pw < P) memset(pin, 0, (size_t)nb * P * P * sizeof(float));
+            for (int b = 0; b < nb; ++b)
+                for (int y = 0; y < ph; ++y)
+                    memcpy(pin + ((size_t)b * P + y) * P,
+                           rowbuf + ((size_t)b * P + y) * W + px, (size_t)pw * sizeof(float));
+            bnn_forward_react(m, pin, P, P, pout);
+            for (int c = 0; c < ncl; ++c)
+                for (int y = 0; y < ph; ++y)
+                    memcpy(logits + ((size_t)c * H + py + y) * W + px,
+                           pout + ((size_t)c * P + y) * P, (size_t)pw * sizeof(float));
+        }
+    }
+    rs_free(rowbuf); rs_free(pin); rs_free(pout);
+}
+
+/* streaming API: the cube is read strip-by-strip from a file (row-major
+ * [n_bands, H, W] float32), so the full 313 MB input is never resident. */
+typedef struct { FILE *f; int H; } file_ctx;
+static void file_reader(void *vc, int r0, int r1, int W, int nb, float *dst) {
+    file_ctx *c = vc;
+    for (int b = 0; b < nb; ++b) {
+        long off = ((long)b * c->H + r0) * W * (long)sizeof(float);
+        if (fseek(c->f, off, SEEK_SET) != 0 ||
+            fread(dst + (size_t)b * (r1 - r0) * W, sizeof(float), (size_t)(r1 - r0) * W, c->f)
+                != (size_t)(r1 - r0) * W) {
+            fprintf(stderr, "file_reader: short read band %d rows %d..%d\n", b, r0, r1); exit(1);
+        }
+    }
+}
+void bnn_forward_react_file(const ModelR *m, FILE *in_f, int H, int W, float *logits) {
+    file_ctx c = { in_f, H };
+    forward_core(m, file_reader, &c, H, W, logits);
 }
 
 static void free_conv(ConvR *c) { free(c->packed); free(c->wsign); free(c->alpha); }

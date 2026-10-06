@@ -7,6 +7,7 @@
 typedef struct { void *ptr; size_t cap; size_t used; int in_use; } Blk;
 static Blk B[RS_MAXBLK];
 static int N = 0, enabled = 0;
+static int poison = -1;
 static size_t cur_used = 0, peak_used = 0;
 static size_t roundup(size_t n) { return (n + 63) & ~(size_t)63; }
 
@@ -26,7 +27,9 @@ static void *al(size_t n, int zero) {
         B[N].ptr = p; B[N].cap = cap; B[N].in_use = 1; best = N++;
     } else B[best].in_use = 1;
     B[best].used = cap; cur_used += cap; if (cur_used > peak_used) peak_used = cur_used;
+    if (poison == -1) { const char *e = getenv("BNN_ARENA_POISON"); poison = e ? (atoi(e) & 255) : -2; }
     if (zero) memset(B[best].ptr, 0, n);
+    else if (poison >= 0) memset(B[best].ptr, poison, n);   /* debug: expose uninitialised reads */
     return B[best].ptr;
 }
 void *rs_alloc(size_t n) { return al(n, 0); }

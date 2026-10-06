@@ -89,5 +89,12 @@ ModelR *bnn_load_react(const char *path);
 void bnn_free_react(ModelR *m);
 /* input: [n_bands,H,W] float; logits: [n_classes,H,W] float (caller allocs) */
 void bnn_forward_react(const ModelR *m, const float *input, int H, int W, float *logits);
+/* streaming variant: reads the [n_bands,H,W] f32 cube strip-by-strip from in_f */
+#include <stdio.h>
+void bnn_forward_react_file(const ModelR *m, FILE *in_f, int H, int W, float *logits);
+/* patch-wise forward: independent PxP patches (matches 32x32 patch training) */
+void bnn_forward_react_patched(const ModelR *m, const float *input, int H, int W, float *logits, int P);
+/* same, reading the cube from a file one patch-row at a time (cube never resident) */
+void bnn_forward_react_patched_file(const ModelR *m, FILE *f, int H, int W, float *logits, int P);
 
 #endif

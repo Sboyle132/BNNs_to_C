@@ -136,6 +136,48 @@ def infer_torch(model, cube):
     return logits[:, :H, :W]
 
 
+def infer_torch_patched(model, cube, P=32):
+    """Full network on independent PxP patches (zero-padded at borders), stitched.
+    Reproduces 32x32 patch inference (training), not whole-capture."""
+    import torch
+    nb, H, W = cube.shape
+    ncl = model.outc.weight.shape[0] if hasattr(model, "outc") else 3
+    out = np.zeros((ncl, H, W), np.float32)
+    for py in range(0, H, P):
+        ph = min(P, H - py)
+        for px in range(0, W, P):
+            pw = min(P, W - px)
+            patch = np.zeros((nb, P, P), np.float32)
+            patch[:, :ph, :pw] = cube[:, py:py+ph, px:px+pw]
+            with torch.no_grad():
+                o = model(torch.from_numpy(patch[None]).float()).numpy()[0]
+            out[:, py:py+ph, px:px+pw] = o[:, :ph, :pw]
+    return out
+
+
+def infer_c_react_patched(model, cube, engine=None, n_bands=120, n_classes=3, P=32):
+    """C patch engine: writes the cube to a temp file and runs bnn_infer_react
+    with the patch<P>: prefix. No pad-to-16 (patches are already PxP)."""
+    import subprocess, tempfile
+    here = os.path.dirname(os.path.abspath(__file__))
+    bnn2c = os.path.abspath(os.path.join(here, "..", "bnn2c"))
+    if bnn2c not in sys.path: sys.path.insert(0, bnn2c)
+    import blob_react as BR
+    engine = engine or os.path.abspath(os.path.join(here, "..", "..", "csrc", "bnn_infer_react"))
+    _, H, W = cube.shape
+    key = id(model)
+    if key not in _REACT_BLOB:
+        d = tempfile.mkdtemp(prefix="react_blob_"); _REACT_BLOB[key] = os.path.join(d, "w.blob")
+        BR.write_blob_react(model, _REACT_BLOB[key], n_bands=n_bands, n_classes=n_classes)
+    with tempfile.TemporaryDirectory(prefix="react_patch_") as td:
+        fin, fout = os.path.join(td, "in.bin"), os.path.join(td, "out.bin")
+        np.ascontiguousarray(cube, np.float32).tofile(fin)
+        r = subprocess.run([engine, _REACT_BLOB[key], f"patch{P}:mem:{fin}", fout, str(H), str(W), "1"],
+                           capture_output=True, text=True)
+        if r.returncode != 0: raise RuntimeError(f"patch engine failed: {r.stderr.strip()}")
+        return np.fromfile(fout, np.float32).reshape(n_classes, H, W)
+
+
 def infer_c(model, cube, stem=False):
     """Run the full capture through the C engine by reusing forward_driver's
     chained C ops (which are the same kernels the standalone binary uses).
@@ -245,6 +287,10 @@ def main():
     ap.add_argument("--react", action="store_true",
                     help="build the ReActNet model; the C backend runs the "
                          "standalone v3 engine (see --react-engine)")
+    ap.add_argument("--patchwise", type=int, default=0,
+                    help="ReActNet: run patch-wise with independent PxP patches "
+                         "(matches 32x32 patch training) instead of whole-capture; "
+                         "P multiple of 16, e.g. --patchwise 32")
     ap.add_argument("--react-engine", default=None,
                     help="path to bnn_infer_react (default: <repo>/csrc/bnn_infer_react)")
     ap.add_argument("--project-dir", default=os.environ.get("HYPSO_REPO", "."))
@@ -336,9 +382,17 @@ def main():
         cube, gt = load_capture_cube(cfg, args.project_dir, index, normaliser,
                                      band_indices, cid)
         if args.verify:
-            lt = infer_torch(model, cube)
-            lc = (infer_c_react(model, cube, args.react_engine, args.n_bands, args.n_classes)
-                  if args.react else infer_c(model, cube, stem=(args.stem != "none")))
+            if args.patchwise:
+                lt = infer_torch_patched(model, cube, args.patchwise)
+                lc = infer_c_react_patched(model, cube, args.react_engine, args.n_bands, args.n_classes, args.patchwise)
+                lw = infer_torch(model, cube)   # whole-capture torch, to show the training/deployment gap
+                gap = float((lt.argmax(0) != lw.argmax(0)).mean())
+                print(f"  [{cid}] torch patch-wise vs torch whole-capture differ {gap*100:.2f}% "
+                      f"(these are different computations; patch-wise matches 32x32 training)")
+            else:
+                lt = infer_torch(model, cube)
+                lc = (infer_c_react(model, cube, args.react_engine, args.n_bands, args.n_classes)
+                      if args.react else infer_c(model, cube, stem=(args.stem != "none")))
             st, sc = lt.argmax(0), lc.argmax(0)
             agree = float((st == sc).mean())
             ndis = int((st != sc).sum())
